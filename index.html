@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Личная база знаний с иерархическим деревом заметок. Данные хранятся в вашем браузере.">
+  <title>Личная база знаний</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="Боковая панель с деревом заметок">
+      <div class="sidebar__header">
+        <button class="brand" id="brand-home" type="button" aria-label="Перейти на главную">
+          <span class="brand__mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15.5H6.5A2.5 2.5 0 0 0 4 21V5.5Z"/>
+              <path d="M4 18.5A2.5 2.5 0 0 1 6.5 16H20"/>
+              <path d="M8 7h8"/>
+            </svg>
+          </span>
+          <span class="brand__text">
+            <span class="brand__name">Заметки</span>
+            <span class="brand__caption">база знаний</span>
+          </span>
+        </button>
+
+        <button class="icon-btn sidebar__close" id="sidebar-close" type="button" aria-label="Закрыть панель">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <path d="m6 6 12 12M18 6 6 18"/>
+          </svg>
+        </button>
+      </div>
+
+      <button class="new-note-btn" id="new-note" type="button">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M12 5v14M5 12h14"/>
+        </svg>
+        <span>Новая заметка</span>
+      </button>
+
+      <button
+        class="sort-toggle"
+        id="sort-by-updated"
+        type="button"
+        aria-pressed="false"
+        title="Сортировать заметки внутри каждого уровня по дате изменения"
+      >
+        <svg class="sort-toggle__icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+          <path d="M4 6h16M4 12h10M4 18h6"/>
+        </svg>
+        <span class="sort-toggle__label">Сортировка по дате изменения</span>
+        <span class="sort-toggle__switch" aria-hidden="true"></span>
+      </button>
+
+      <div class="sidebar__section">
+        <span class="sidebar__label">Дерево заметок</span>
+        <span class="sidebar__count" id="notes-count">0 заметок</span>
+      </div>
+
+      <nav class="tree" id="tree" aria-label="Все заметки"></nav>
+
+      <div class="sidebar-empty" id="tree-empty">
+        <span class="sidebar-empty__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m12 3 8 4.5-8 4.5-8-4.5L12 3Z"/>
+            <path d="m4 12 8 4.5 8-4.5"/>
+            <path d="m4 16.5 8 4.5 8-4.5"/>
+          </svg>
+        </span>
+        <p class="sidebar-empty__title">Пока пусто</p>
+        <p class="sidebar-empty__text">Создайте первую заметку, и здесь появится дерево.</p>
+      </div>
+
+      <div class="sidebar__footer">
+        <div class="backup-actions" role="group" aria-label="Резервная копия заметок">
+          <button
+            class="backup-btn"
+            id="export-notes"
+            type="button"
+            title="Скачать все заметки в файл notes.json"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 4v11"/>
+              <path d="m8 11 4 4 4-4"/>
+              <path d="M5 20h14"/>
+            </svg>
+            <span>Скачать базу</span>
+          </button>
+
+          <button
+            class="backup-btn"
+            id="import-notes"
+            type="button"
+            title="Добавить заметки из файла notes.json"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 16V5"/>
+              <path d="m8 9 4-4 4 4"/>
+              <path d="M5 20h14"/>
+            </svg>
+            <span>Загрузить базу</span>
+          </button>
+
+          <input id="import-file" type="file" accept=".json,application/json" hidden>
+        </div>
+
+        <p class="local-note">
+          <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="4" y="10" width="16" height="11" rx="2.5"/>
+            <path d="M8 10V7a4 4 0 0 1 8 0v3"/>
+          </svg>
+          <span>Данные хранятся в LocalStorage</span>
+        </p>
+      </div>
+    </aside>
+
+    <div class="sidebar-scrim" id="sidebar-scrim" aria-hidden="true"></div>
+
+    <div class="main">
+      <header class="mobile-bar">
+        <button
+          class="icon-btn"
+          id="sidebar-toggle"
+          type="button"
+          aria-controls="sidebar"
+          aria-expanded="false"
+          aria-label="Открыть дерево заметок"
+        >
+          <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16"/>
+          </svg>
+        </button>
+        <span class="mobile-bar__title">Личная база знаний</span>
+      </header>
+
+      <main class="workspace">
+        <nav class="breadcrumbs" id="breadcrumbs" aria-label="Хлебные крошки"></nav>
+
+        <section class="home-view" id="home-view" aria-labelledby="home-title">
+          <div class="hero">
+            <p class="hero__eyebrow">
+              <span class="hero__dot" aria-hidden="true"></span>
+              Личное пространство
+            </p>
+            <h1 id="home-title">Личная<br><em>база знаний</em></h1>
+            <p class="hero__lead">Собирайте заметки в понятную иерархию: от главной идеи до деталей. Всё хранится в вашем браузере.</p>
+            <button class="btn-primary btn-primary--large" id="home-new-note" type="button">
+              <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                <path d="M12 5v14M5 12h14"/>
+              </svg>
+              <span>Создать заметку</span>
+            </button>
+          </div>
+
+          <div class="home-stats" aria-label="Статистика базы">
+            <div class="stat-card">
+              <span class="stat-card__value" id="home-notes-total">0</span>
+              <span class="stat-card__label">всего заметок</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-card__value" id="home-roots-total">0</span>
+              <span class="stat-card__label">в корне</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-card__value" id="home-nested-total">0</span>
+              <span class="stat-card__label">с дочерними</span>
+            </div>
+          </div>
+
+          <div class="home-tip">
+            <span class="home-tip__icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15.5H6.5A2.5 2.5 0 0 0 4 21V5.5Z"/>
+                <path d="M4 18.5A2.5 2.5 0 0 1 6.5 16H20"/>
+              </svg>
+            </span>
+            <p>Выберите заметку в дереве слева, чтобы открыть её. Вложенность можно изменить в форме заметки.</p>
+          </div>
+        </section>
+
+        <section class="editor-view" id="editor-view" aria-labelledby="editor-mode" hidden>
+          <div class="editor-card">
+            <div class="editor-card__top">
+              <p class="section-label" id="editor-mode">Редактирование</p>
+              <span class="editor-card__hint">Изменения сохраняются вручную</span>
+            </div>
+
+            <form id="note-form" novalidate>
+              <div class="field">
+                <label for="note-title">Заголовок</label>
+                <input
+                  id="note-title"
+                  name="title"
+                  type="text"
+                  placeholder="Например: идеи для нового проекта"
+                  maxlength="120"
+                  autocomplete="off"
+                  required
+                  aria-describedby="note-title-error"
+                >
+                <p class="field__error" id="note-title-error" role="alert"></p>
+                <time class="note-updated" id="note-updated-at"></time>
+              </div>
+
+              <div class="field">
+                <label for="note-parent">Родительская заметка</label>
+                <div class="select-wrap">
+                  <select id="note-parent" name="parent_id" aria-describedby="parent-hint"></select>
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="m6 9 6 6 6-6"/>
+                  </svg>
+                </div>
+                <p class="field__hint" id="parent-hint">Выберите «Корень», чтобы заметка находилась на верхнем уровне.</p>
+              </div>
+
+              <div class="field">
+                <div class="field__label-row">
+                  <label for="note-content">Содержание</label>
+                  <span class="char-count" id="note-content-count" aria-hidden="true">0 / 20 000</span>
+                </div>
+                <textarea
+                  id="note-content"
+                  name="content"
+                  rows="12"
+                  placeholder="Запишите мысль целиком, чтобы позже было легко вернуться к ней…"
+                  maxlength="20000"
+                  aria-describedby="note-content-count note-content-error"
+                ></textarea>
+                <p class="field__error" id="note-content-error" role="alert"></p>
+              </div>
+
+              <section class="attachments" aria-labelledby="attachments-title">
+                <div class="attachments__header">
+                  <div class="attachments__heading">
+                    <h3 class="attachments__title" id="attachments-title">Вложения</h3>
+                    <p class="attachments__hint" id="attachments-hint">Изображения и документы, привязанные к этой заметке.</p>
+                  </div>
+
+                  <button class="attach-btn" id="attach-file" type="button">
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                    </svg>
+                    <span>Прикрепить файл</span>
+                  </button>
+
+                  <input id="attachment-input" type="file" multiple hidden>
+                </div>
+
+                <div class="attachments__list" id="attachments-list"></div>
+                <p class="attachments__empty" id="attachments-empty">Пока нет вложений.</p>
+              </section>
+
+              <div class="editor-actions">
+                <button class="btn-danger" id="delete-note" type="button" hidden>
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 7h16"/>
+                    <path d="M9.5 7V4.8h5V7"/>
+                    <path d="M6.5 7l.8 12h9.4l.8-12"/>
+                    <path d="M10 11v4.5M14 11v4.5"/>
+                  </svg>
+                  <span>Удалить</span>
+                </button>
+
+                <div class="editor-actions__right">
+                  <span class="save-hint"><kbd>Ctrl</kbd> + <kbd>Enter</kbd></span>
+                  <button class="btn-primary" type="submit">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="m5 12 4.5 4.5L19 7"/>
+                    </svg>
+                    <span id="save-note-label">Сохранить</span>
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true">
+    <span class="toast__mark" aria-hidden="true"></span>
+    <span class="toast__message" id="toast-message"></span>
+    <button class="toast__action" id="toast-action" type="button" hidden>Отменить</button>
+  </div>
+</body>
+</html>
