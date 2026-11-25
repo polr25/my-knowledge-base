@@ -12,7 +12,7 @@
   <script src="script.js" defer></script>
 </head>
 <body>
-  <div class="app-shell">
+  <div>
     <aside class="sidebar" id="sidebar" aria-label="Боковая панель с деревом заметок">
       <div class="sidebar__header">
         <button class="brand" id="brand-home" type="button" aria-label="Перейти на главную">
@@ -77,7 +77,20 @@
       </div>
 
       <div class="sidebar__footer">
-        <div class="backup-actions" role="group" aria-label="Резервная копия заметок">
+        <div class="backup-actions" role="group" aria-label="Настройки и резервные копии">
+          <button
+            class="backup-btn"
+            id="settings-open"
+            type="button"
+            title="Настройки подключения к Яндекс.Диску"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+            <span>Настройки</span>
+          </button>
+
           <button
             class="backup-btn"
             id="export-notes"
@@ -114,7 +127,7 @@
             <rect x="4" y="10" width="16" height="11" rx="2.5"/>
             <path d="M8 10V7a4 4 0 0 1 8 0v3"/>
           </svg>
-          <span>Данные хранятся в LocalStorage</span>
+          <span>Заметки — локально, файлы — на Диске</span>
         </p>
       </div>
     </aside>
@@ -238,14 +251,15 @@
                 <div class="attachments__header">
                   <div class="attachments__heading">
                     <h3 class="attachments__title" id="attachments-title">Вложения</h3>
-                    <p class="attachments__hint" id="attachments-hint">Изображения и документы, привязанные к этой заметке.</p>
+                    <p class="attachments__hint" id="attachments-hint">Файлы загружаются на Яндекс.Диск, до 1 ГБ.</p>
                   </div>
 
-                  <button class="attach-btn" id="attach-file" type="button">
+                  <button class="attach-btn" id="attach-file" type="button" title="Загрузить файл на Яндекс.Диск (до 1 ГБ)">
                     <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                     </svg>
-                    <span>Прикрепить файл</span>
+                    <span class="attach-spinner" id="attach-spinner" aria-hidden="true" hidden></span>
+                    <span id="attach-file-label">Прикрепить файл</span>
                   </button>
 
                   <input id="attachment-input" type="file" multiple hidden>
@@ -288,5 +302,41 @@
     <span class="toast__message" id="toast-message"></span>
     <button class="toast__action" id="toast-action" type="button" hidden>Отменить</button>
   </div>
+
+  <dialog class="settings-dialog" id="settings-dialog" aria-labelledby="settings-title">
+    <form class="settings-form" id="settings-form">
+      <div class="settings-dialog__head">
+        <h2 class="settings-title" id="settings-title">Настройки</h2>
+        <button class="icon-btn" id="settings-close" type="button" aria-label="Закрыть настройки">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <path d="m6 6 12 12M18 6 6 18"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="settings-field">
+        <label for="yandex-token">OAuth-токен Яндекс.Диска</label>
+        <input
+          class="settings-input"
+          id="yandex-token"
+          name="yandex-token"
+          type="password"
+          placeholder="Вставьте OAuth-токен"
+          autocomplete="off"
+          spellcheck="false"
+          aria-describedby="settings-help settings-error"
+        >
+        <p class="settings-help" id="settings-help">
+          Токен хранится только в этом браузере в localStorage и используется для загрузки файлов на ваш Яндекс.Диск.
+        </p>
+        <p class="settings-error" id="settings-error" role="alert" hidden></p>
+      </div>
+
+      <div class="settings-actions">
+        <button class="btn-secondary" id="settings-clear" type="button">Удалить токен</button>
+        <button class="btn-primary" type="submit">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
 </body>
 </html>

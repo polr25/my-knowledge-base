@@ -6,21 +6,25 @@
 
 const STORAGE_KEY = 'knowledge-base.notes.v1';
 const SORT_STORAGE_KEY = 'knowledge-base.sort-by-updated';
+const YANDEX_TOKEN_STORAGE_KEY = 'knowledge-base.yandex-oauth-token';
 const MAX_CONTENT_LENGTH = 20000;
 const MAX_IMPORT_FILE_SIZE = 10 * 1024 * 1024;
 const BACKUP_FORMAT = 'personal-knowledge-base';
-const BACKUP_VERSION = 3;
-const ATTACHMENT_DB_NAME = 'knowledge-base-files';
-const ATTACHMENT_DB_VERSION = 1;
-const ATTACHMENT_STORE_NAME = 'attachments';
+const BACKUP_VERSION = 4;
+const YANDEX_API_BASE = 'https://cloud-api.yandex.net/v1/disk';
+const MAX_ATTACHMENT_SIZE = 1000 * 1000 * 1000;
+const API_REQUEST_TIMEOUT = 30000;
 const ATTACHMENT_IMAGE_TYPES = new Set([
   'image/jpeg',
   'image/jpg',
   'image/png',
   'image/gif',
+  'image/webp',
+  'image/avif',
+  'image/svg+xml',
+  'image/bmp',
 ]);
 const NOTE_UNDO_DURATION = 7000;
-const ATTACHMENT_CLEANUP_DELAY = 9000;
 
 const sidebar = document.querySelector('#sidebar');
 const sidebarToggle = document.querySelector('#sidebar-toggle');
@@ -51,10 +55,19 @@ const parentSelect = document.querySelector('#note-parent');
 const deleteButton = document.querySelector('#delete-note');
 const saveNoteLabel = document.querySelector('#save-note-label');
 const attachButton = document.querySelector('#attach-file');
+const attachFileLabel = document.querySelector('#attach-file-label');
+const attachSpinner = document.querySelector('#attach-spinner');
 const attachmentInput = document.querySelector('#attachment-input');
 const attachmentsList = document.querySelector('#attachments-list');
 const attachmentsHint = document.querySelector('#attachments-hint');
 const attachmentsEmpty = document.querySelector('#attachments-empty');
+const settingsOpenButton = document.querySelector('#settings-open');
+const settingsDialog = document.querySelector('#settings-dialog');
+const settingsForm = document.querySelector('#settings-form');
+const settingsCloseButton = document.querySelector('#settings-close');
+const settingsClearButton = document.querySelector('#settings-clear');
+const settingsError = document.querySelector('#settings-error');
+const yandexTokenInput = document.querySelector('#yandex-token');
 const exportButton = document.querySelector('#export-notes');
 const importButton = document.querySelector('#import-notes');
 const importFileInput = document.querySelector('#import-file');
@@ -101,16 +114,11 @@ let isMobileSidebarOpen = false;
 let toastTimerId = null;
 let toastActionHandler = null;
 
-let attachmentDbPromise = null;
-let attachmentObjectUrls = [];
-let attachmentLoadToken = 0;
-let attachmentsAvailable = Boolean(window.indexedDB);
-let attachmentLoading = false;
+let yandexToken = '';
 let attachmentUploading = false;
-let attachmentStorageErrorShown = false;
-let notesStorageReadSucceeded = false;
+let uploadProgress = 0;
+let uploadingNoteId = null;
 let deleteLocked = false;
-const pendingAttachmentCleanupTimers = new Map();
 
 function debounce(callback, delay = 120) {
   let timeoutId = null;
@@ -150,11 +158,62 @@ function normalizeTimestamp(value) {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+function isHttpsUrl(value) {
+  try {
+    return new URL(value).protocol === 'https:';
+  } catch (error) {
+    return false;
+  }
+}
+
+function normalizeAttachments(value) {
+  if (!Array.isArray(value)) return [];
+
+  const seenIds = new Set();
+
+  return value
+    .filter((entry) => entry && typeof entry === 'object' && !Array.isArray(entry))
+    .map((entry) => {
+      const publicUrl =
+        typeof entry.public_url === 'string' ? entry.public_url.trim() : '';
+
+      if (!publicUrl || !isHttpsUrl(publicUrl)) return null;
+
+      let id =
+        typeof entry.id === 'string' && entry.id.trim()
+          ? entry.id.trim()
+          : createId();
+
+      while (seenIds.has(id)) {
+        id = createId();
+      }
+      seenIds.add(id);
+
+      const numericSize = Number(entry.size);
+
+      return {
+        id,
+        name:
+          typeof entry.name === 'string' && entry.name.trim()
+            ? entry.name
+            : 'Файл',
+        type: typeof entry.type === 'string' ? entry.type : '',
+        size: Number.isFinite(numericSize) ? Math.max(0, numericSize) : 0,
+        public_url: publicUrl,
+        remote_path:
+          typeof entry.remote_path === 'string' ? entry.remote_path : '',
+        uploadedAt: normalizeTimestamp(entry.uploadedAt),
+      };
+    })
+    .filter(Boolean);
+}
+
 function sanitizeNotes(list) {
   const cleaned = list.map((note) => ({
     ...note,
     parent_id: note.parent_id || null,
     updatedAt: normalizeTimestamp(note.updatedAt),
+    attachments: normalizeAttachments(note.attachments),
   }));
 
   const ids = new Set(cleaned.map((note) => note.id));
@@ -189,16 +248,10 @@ function sanitizeNotes(list) {
 function readNotes() {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      notesStorageReadSucceeded = true;
-      return [];
-    }
+    if (!raw) return [];
 
     const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      notesStorageReadSucceeded = false;
-      return [];
-    }
+    if (!Array.isArray(parsed)) return [];
 
     const seenIds = new Set();
 
@@ -226,6 +279,7 @@ function readNotes() {
           content: typeof entry.content === 'string' ? entry.content : '',
           parent_id: parentId,
           updatedAt: normalizeTimestamp(entry.updatedAt),
+          attachments: normalizeAttachments(entry.attachments),
         };
       })
       .filter((note) => note.title.trim() || note.content.trim());
@@ -239,10 +293,8 @@ function readNotes() {
       console.warn('Не удалось обновить формат данных в LocalStorage.', error);
     }
 
-    notesStorageReadSucceeded = true;
     return cleanNotes;
   } catch (error) {
-    notesStorageReadSucceeded = false;
     console.warn('Не удалось прочитать заметки из LocalStorage.', error);
     return [];
   }
@@ -720,7 +772,7 @@ function showHome() {
   renderBreadcrumbs();
   renderHomeStats();
   updateDocumentTitle();
-  invalidateAttachmentsView();
+  clearAttachmentsView('Пока нет вложений.');
   updateAttachmentControls();
   closeMobileSidebar({ restoreFocus: true });
   scrollToTop();
@@ -791,7 +843,7 @@ function startCreatingNote(parentId = null) {
   }
 }
 
-function fillEditor(note, { reloadAttachments = true } = {}) {
+function fillEditor(note) {
   titleInput.value = note.title;
   contentInput.value = note.content;
   populateParentSelect(note.id, note.parent_id);
@@ -801,10 +853,8 @@ function fillEditor(note, { reloadAttachments = true } = {}) {
   renderUpdatedAt(note.updatedAt);
   clearFieldError(titleInput, titleError);
   clearFieldError(contentInput, contentError);
-
-  if (reloadAttachments) {
-    void loadAttachmentsForNote(note.id);
-  }
+  renderAttachmentsForNote(note);
+  updateAttachmentControls();
 }
 
 function setEditorMode(creating) {
@@ -877,6 +927,17 @@ function clearFieldError(input, errorElement) {
 function handleSubmit(event) {
   event.preventDefault();
 
+  if (attachmentUploading && uploadingNoteId === selectedNoteId) {
+    showToast(
+      'Дождитесь окончания загрузки файла. Сохранить заметку можно после завершения загрузки.',
+      {
+        type: 'error',
+        duration: 6000,
+      },
+    );
+    return;
+  }
+
   const creating = isCreating;
   const title = titleInput.value.trim();
   const content = contentInput.value.trim();
@@ -937,6 +998,7 @@ function handleSubmit(event) {
       content,
       parent_id: parentId,
       updatedAt: savedAt,
+      attachments: [],
     };
 
     if (!persistNotes([...notes, savedNote])) {
@@ -975,7 +1037,7 @@ function handleSubmit(event) {
   expandAncestors(savedNote.id);
 
   const storedNote = getNoteById(savedNote.id) || savedNote;
-  fillEditor(storedNote, { reloadAttachments: creating });
+  fillEditor(storedNote);
 
   if (creating || parentChanged || sortByUpdated) {
     renderTree();
@@ -1030,8 +1092,6 @@ function deleteCurrentNote() {
     return;
   }
 
-  scheduleAttachmentCleanup(removedNote.id);
-
   if (parentId && getNoteById(parentId)) {
     renderTree();
     openNote(parentId);
@@ -1049,8 +1109,6 @@ function deleteCurrentNote() {
     actionLabel: 'Отменить',
     duration: NOTE_UNDO_DURATION,
     onAction: () => {
-      cancelAttachmentCleanup(removedNote.id);
-
       if (getNoteById(removedNote.id)) return;
 
       const restored = [...notes];
@@ -1079,246 +1137,367 @@ function deleteCurrentNote() {
 }
 
 /* =========================================================
-   Вложения (IndexedDB)
+   Яндекс.Диск, настройки и вложения
    ========================================================= */
 
-function openAttachmentDb() {
-  if (!attachmentsAvailable) {
-    return Promise.reject(new Error('Хранилище файлов недоступно.'));
+function readYandexToken() {
+  try {
+    return normalizeYandexToken(
+      window.localStorage.getItem(YANDEX_TOKEN_STORAGE_KEY) || '',
+    );
+  } catch (error) {
+    console.warn('Не удалось прочитать OAuth-токен Яндекс.Диска.', error);
+    return '';
+  }
+}
+
+function writeYandexToken(token) {
+  try {
+    if (token) {
+      window.localStorage.setItem(YANDEX_TOKEN_STORAGE_KEY, token);
+    } else {
+      window.localStorage.removeItem(YANDEX_TOKEN_STORAGE_KEY);
+    }
+    return true;
+  } catch (error) {
+    console.warn('Не удалось сохранить OAuth-токен Яндекс.Диска.', error);
+    return false;
+  }
+}
+
+function normalizeYandexToken(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^OAuth\s+/i, '')
+    .trim();
+}
+
+function setSettingsError(message = '') {
+  settingsError.textContent = message;
+  settingsError.hidden = !message;
+}
+
+function openSettings(message = '') {
+  yandexTokenInput.value = yandexToken;
+  settingsClearButton.disabled = !yandexToken;
+  setSettingsError(message);
+
+  if (!settingsDialog.open) {
+    if (typeof settingsDialog.showModal === 'function') {
+      settingsDialog.showModal();
+    } else {
+      settingsDialog.setAttribute('open', '');
+    }
   }
 
-  if (attachmentDbPromise) return attachmentDbPromise;
-
-  attachmentDbPromise = new Promise((resolve, reject) => {
-    let request;
-
-    try {
-      request = window.indexedDB.open(ATTACHMENT_DB_NAME, ATTACHMENT_DB_VERSION);
-    } catch (error) {
-      attachmentsAvailable = false;
-      reject(error);
-      return;
+  document.body.classList.add('settings-open');
+  window.setTimeout(() => {
+    if (settingsDialog.open) {
+      yandexTokenInput.focus();
     }
-
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      let store;
-
-      if (!db.objectStoreNames.contains(ATTACHMENT_STORE_NAME)) {
-        store = db.createObjectStore(ATTACHMENT_STORE_NAME, { keyPath: 'id' });
-      } else {
-        store = request.transaction.objectStore(ATTACHMENT_STORE_NAME);
-      }
-
-      if (!store.indexNames.contains('noteId')) {
-        store.createIndex('noteId', 'noteId', { unique: false });
-      }
-    };
-
-    request.onsuccess = () => {
-      const db = request.result;
-      db.onversionchange = () => {
-        db.close();
-        attachmentDbPromise = null;
-      };
-      resolve(db);
-    };
-
-    request.onerror = () => {
-      reject(request.error || new Error('Не удалось открыть хранилище файлов.'));
-    };
-  }).catch((error) => {
-    attachmentDbPromise = null;
-    attachmentsAvailable = false;
-    throw error;
-  });
-
-  return attachmentDbPromise;
+  }, 0);
 }
 
-async function addAttachmentRecords(records) {
-  const db = await openAttachmentDb();
+function closeSettings() {
+  if (settingsDialog.open && typeof settingsDialog.close === 'function') {
+    settingsDialog.close();
+  } else {
+    settingsDialog.removeAttribute('open');
+  }
 
-  await new Promise((resolve, reject) => {
-    const transaction = db.transaction(ATTACHMENT_STORE_NAME, 'readwrite');
-    const store = transaction.objectStore(ATTACHMENT_STORE_NAME);
-
-    for (const record of records) {
-      store.put(record);
-    }
-
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () =>
-      reject(transaction.error || new Error('Не удалось сохранить вложения.'));
-    transaction.onabort = () =>
-      reject(transaction.error || new Error('Не удалось сохранить вложения.'));
-  });
+  document.body.classList.remove('settings-open');
+  settingsOpenButton.focus();
 }
 
-async function getAttachmentsForNote(noteId) {
-  const db = await openAttachmentDb();
+function handleSettingsSubmit(event) {
+  event.preventDefault();
 
-  const records = await new Promise((resolve, reject) => {
-    const transaction = db.transaction(ATTACHMENT_STORE_NAME, 'readonly');
-    const index = transaction.objectStore(ATTACHMENT_STORE_NAME).index('noteId');
-    const request = index.getAll(window.IDBKeyRange.only(noteId));
+  const token = normalizeYandexToken(yandexTokenInput.value);
 
-    transaction.onerror = () =>
-      reject(transaction.error || new Error('Не удалось прочитать вложения.'));
-    transaction.onabort = () =>
-      reject(transaction.error || new Error('Не удалось прочитать вложения.'));
-    request.onsuccess = () => resolve(request.result || []);
-    request.onerror = () =>
-      reject(request.error || new Error('Не удалось прочитать вложения.'));
-  });
+  if (!token) {
+    setSettingsError('Введите OAuth-токен Яндекс.Диска.');
+    yandexTokenInput.focus();
+    return;
+  }
 
-  return records.sort((first, second) => {
-    const firstTime = Date.parse(first.createdAt) || 0;
-    const secondTime = Date.parse(second.createdAt) || 0;
-    return firstTime - secondTime;
-  });
+  if (!writeYandexToken(token)) {
+    setSettingsError('Не удалось сохранить токен в localStorage.');
+    return;
+  }
+
+  yandexToken = token;
+  setSettingsError('');
+  settingsClearButton.disabled = false;
+  refreshAttachmentsForCurrentNote();
+  closeSettings();
+  showToast('OAuth-токен сохранён.');
 }
 
-async function deleteAttachmentRecords(attachmentIds) {
-  if (attachmentIds.length === 0) return;
+function handleClearYandexToken() {
+  if (!writeYandexToken('')) {
+    setSettingsError('Не удалось удалить токен из localStorage.');
+    return;
+  }
 
-  const db = await openAttachmentDb();
-
-  await new Promise((resolve, reject) => {
-    const transaction = db.transaction(ATTACHMENT_STORE_NAME, 'readwrite');
-    const store = transaction.objectStore(ATTACHMENT_STORE_NAME);
-
-    for (const attachmentId of attachmentIds) {
-      store.delete(attachmentId);
-    }
-
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () =>
-      reject(transaction.error || new Error('Не удалось удалить вложения.'));
-    transaction.onabort = () =>
-      reject(transaction.error || new Error('Не удалось удалить вложения.'));
-  });
+  yandexToken = '';
+  yandexTokenInput.value = '';
+  setSettingsError('');
+  settingsClearButton.disabled = true;
+  refreshAttachmentsForCurrentNote();
+  closeSettings();
+  showToast('OAuth-токен удалён.');
 }
 
-async function deleteAttachmentRecord(attachmentId) {
-  await deleteAttachmentRecords([attachmentId]);
+function refreshAttachmentsForCurrentNote() {
+  const note =
+    !isCreating && selectedNoteId ? getNoteById(selectedNoteId) : null;
+
+  if (note) {
+    renderAttachmentsForNote(note);
+  }
+
+  updateAttachmentControls();
 }
 
-async function getAttachmentIdsForNote(noteId) {
-  const db = await openAttachmentDb();
+/* ---------- Яндекс.Диск API ---------- */
 
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(ATTACHMENT_STORE_NAME, 'readonly');
-    const index = transaction.objectStore(ATTACHMENT_STORE_NAME).index('noteId');
-    const request = index.getAllKeys(window.IDBKeyRange.only(noteId));
+function sanitizeRemoteFileName(name) {
+  const safe = String(name || 'file')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
 
-    transaction.onerror = () =>
-      reject(transaction.error || new Error('Не удалось прочитать вложения.'));
-    transaction.onabort = () =>
-      reject(transaction.error || new Error('Не удалось прочитать вложения.'));
-    request.onsuccess = () => resolve(request.result || []);
-    request.onerror = () =>
-      reject(request.error || new Error('Не удалось прочитать вложения.'));
-  });
+  if (!safe) return 'file';
+  if (safe.length <= 120) return safe;
+
+  const dotIndex = safe.lastIndexOf('.');
+  const extension =
+    dotIndex > 0 && safe.length - dotIndex <= 16 ? safe.slice(dotIndex) : '';
+
+  return `${safe.slice(0, 120 - extension.length).trimEnd()}${extension}`;
 }
 
-async function deleteAttachmentsForNote(noteId) {
-  const attachmentIds = await getAttachmentIdsForNote(noteId);
-  if (attachmentIds.length === 0) return 0;
-
-  await deleteAttachmentRecords(attachmentIds);
-  return attachmentIds.length;
+function createRemotePath(file) {
+  const uniquePrefix = `${Date.now()}-${createId().slice(0, 8)}`;
+  return `app:/${uniquePrefix}-${sanitizeRemoteFileName(file.name)}`;
 }
 
-async function getAttachmentNoteIds() {
-  const db = await openAttachmentDb();
-
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(ATTACHMENT_STORE_NAME, 'readonly');
-    const index = transaction.objectStore(ATTACHMENT_STORE_NAME).index('noteId');
-    const noteIds = new Set();
-    const request = index.openKeyCursor();
-
-    transaction.onerror = () =>
-      reject(transaction.error || new Error('Не удалось прочитать вложения.'));
-    transaction.onabort = () =>
-      reject(transaction.error || new Error('Не удалось прочитать вложения.'));
-    request.onerror = () =>
-      reject(request.error || new Error('Не удалось прочитать вложения.'));
-    request.onsuccess = () => {
-      const cursor = request.result;
-
-      if (!cursor) {
-        resolve([...noteIds]);
-        return;
-      }
-
-      noteIds.add(cursor.key);
-      cursor.continue();
-    };
-  });
-}
-
-async function cleanupOrphanedAttachments(validNoteIds) {
-  if (!attachmentsAvailable) return;
+async function createYandexApiError(response) {
+  let detail = '';
 
   try {
-    const attachmentNoteIds = await getAttachmentNoteIds();
-    const orphanNoteIds = attachmentNoteIds.filter(
-      (noteId) => !validNoteIds.has(noteId),
-    );
+    const data = await response.json();
+    detail = [data.description, data.message, data.error]
+      .find((value) => typeof value === 'string' && value.trim()) || '';
+  } catch (error) {
+    // Яндекс может вернуть пустой ответ или HTML при сетевой ошибке.
+  }
 
-    for (const noteId of orphanNoteIds) {
-      if (getNoteById(noteId)) continue;
-      await deleteAttachmentsForNote(noteId);
+  let message;
+
+  if (response.status === 401) {
+    message =
+      'OAuth-токен недействителен или истёк. Вставьте новый токен в настройках.';
+  } else if (response.status === 403) {
+    message = 'Недостаточно прав для работы с Яндекс.Диском.';
+  } else {
+    message = detail || `Яндекс.Диск вернул ошибку ${response.status}.`;
+  }
+
+  const error = new Error(message);
+  error.status = response.status;
+  error.code =
+    response.status === 401
+      ? 'YANDEX_UNAUTHORIZED'
+      : response.status === 403
+        ? 'YANDEX_FORBIDDEN'
+        : 'YANDEX_API';
+  return error;
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller =
+    typeof window.AbortController === 'function'
+      ? new window.AbortController()
+      : null;
+
+  const timeoutId = window.setTimeout(() => {
+    if (controller) controller.abort();
+  }, API_REQUEST_TIMEOUT);
+
+  try {
+    return await fetch(
+      url,
+      controller ? { ...options, signal: controller.signal } : options,
+    );
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      const timeoutError = new Error(
+        'Яндекс.Диск не ответил вовремя. Проверьте подключение к интернету и повторите попытку.',
+      );
+      timeoutError.code = 'YANDEX_TIMEOUT';
+      throw timeoutError;
     }
 
-    if (orphanNoteIds.length > 0) {
-      console.info(`Очищены вложения для удалённых заметок: ${orphanNoteIds.length}.`);
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+async function getYandexUploadUrl(token, remotePath) {
+  const url = new URL(`${YANDEX_API_BASE}/resources/upload`);
+  url.searchParams.set('path', remotePath);
+  url.searchParams.set('overwrite', 'true');
+
+  const response = await fetchWithTimeout(url.toString(), {
+    method: 'GET',
+    headers: {
+      Authorization: `OAuth ${token}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    throw await createYandexApiError(response);
+  }
+
+  const data = await response.json();
+  if (!data || typeof data.href !== 'string' || !data.href) {
+    throw new Error('Яндекс.Диск не вернул ссылку для загрузки файла.');
+  }
+
+  return data.href;
+}
+
+function uploadFileWithProgress(uploadUrl, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', uploadUrl, true);
+    xhr.timeout = 30 * 60 * 1000;
+
+    // Для загрузки на предподписанный URL не нужен Authorization.
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(Math.min(event.loaded / event.total, 1));
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve();
+      } else {
+        const error = new Error(
+          `Не удалось загрузить файл на Яндекс.Диск (статус ${xhr.status}).`,
+        );
+        error.status = xhr.status;
+        error.code = 'YANDEX_UPLOAD_HTTP';
+        reject(error);
+      }
+    };
+
+    xhr.onerror = () => {
+      const error = new Error(
+        'Сетевая ошибка при загрузке файла на Яндекс.Диск. Проверьте подключение к интернету.',
+      );
+      error.code = 'NETWORK_ERROR';
+      reject(error);
+    };
+
+    xhr.ontimeout = () => {
+      const error = new Error(
+        'Истекло время загрузки файла на Яндекс.Диск. Попробуйте снова.',
+      );
+      error.code = 'UPLOAD_TIMEOUT';
+      reject(error);
+    };
+
+    xhr.onabort = () => {
+      reject(new Error('Загрузка файла на Яндекс.Диск была отменена.'));
+    };
+
+    xhr.send(file);
+  });
+}
+
+async function fetchYandexPublicUrl(token, remotePath) {
+  const url = new URL(`${YANDEX_API_BASE}/resources`);
+  url.searchParams.set('path', remotePath);
+  url.searchParams.set('fields', 'public_url');
+
+  const response = await fetchWithTimeout(url.toString(), {
+    method: 'GET',
+    headers: {
+      Authorization: `OAuth ${token}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw await createYandexApiError(response);
+    }
+    return '';
+  }
+
+  const data = await response.json();
+  return typeof data.public_url === 'string' ? data.public_url : '';
+}
+
+async function publishYandexFile(token, remotePath) {
+  const url = new URL(`${YANDEX_API_BASE}/resources/publish`);
+  url.searchParams.set('path', remotePath);
+
+  const response = await fetchWithTimeout(url.toString(), {
+    method: 'PUT',
+    headers: {
+      Authorization: `OAuth ${token}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    throw await createYandexApiError(response);
+  }
+
+  let publicUrl = '';
+
+  try {
+    const data = await response.json();
+    if (typeof data.public_url === 'string') {
+      publicUrl = data.public_url;
     }
   } catch (error) {
-    console.warn('Не удалось очистить вложения удалённых заметок.', error);
-  }
-}
-
-function scheduleAttachmentCleanup(noteId) {
-  if (!attachmentsAvailable) return;
-
-  const existingTimer = pendingAttachmentCleanupTimers.get(noteId);
-  if (existingTimer) window.clearTimeout(existingTimer);
-
-  const timerId = window.setTimeout(() => {
-    pendingAttachmentCleanupTimers.delete(noteId);
-
-    if (getNoteById(noteId)) return;
-
-    deleteAttachmentsForNote(noteId).catch((error) => {
-      console.warn('Не удалось удалить вложения удалённой заметки.', error);
-    });
-  }, ATTACHMENT_CLEANUP_DELAY);
-
-  pendingAttachmentCleanupTimers.set(noteId, timerId);
-}
-
-function cancelAttachmentCleanup(noteId) {
-  const timerId = pendingAttachmentCleanupTimers.get(noteId);
-  if (!timerId) return;
-
-  window.clearTimeout(timerId);
-  pendingAttachmentCleanupTimers.delete(noteId);
-}
-
-function releaseAttachmentObjectUrls() {
-  for (const objectUrl of attachmentObjectUrls) {
-    URL.revokeObjectURL(objectUrl);
+    // Публикация могла вернуть пустой ответ — проверим метаданные ниже.
   }
 
-  attachmentObjectUrls = [];
+  if (publicUrl) return publicUrl;
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    publicUrl = await fetchYandexPublicUrl(token, remotePath);
+    if (publicUrl) return publicUrl;
+
+    if (attempt < 4) {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    }
+  }
+
+  throw new Error(
+    'Файл загружен, но Яндекс.Диск не вернул публичную ссылку.',
+  );
 }
+
+/* ---------- Отображение вложений ---------- */
 
 function isImageAttachment(record) {
-  const type = String(record.type || record.blob?.type || '').toLowerCase();
-  return ATTACHMENT_IMAGE_TYPES.has(type) || /\.(jpe?g|png|gif)$/i.test(record.name || '');
+  const type = String(record.type || '').toLowerCase();
+  return (
+    ATTACHMENT_IMAGE_TYPES.has(type) ||
+    /\.(jpe?g|png|gif|webp|avif|svg|bmp)$/i.test(record.name || '')
+  );
 }
 
 function getAttachmentExtension(name) {
@@ -1328,6 +1507,7 @@ function getAttachmentExtension(name) {
 
 function getAttachmentTypeLabel(record) {
   const extension = getAttachmentExtension(record.name);
+
   if (extension) return extension;
 
   const type = String(record.type || '').toLowerCase();
@@ -1354,45 +1534,43 @@ function formatFileSize(bytes) {
   return `${formatted} ${units[unitIndex]}`;
 }
 
+function createAttachmentExtLabel(label) {
+  const extension = document.createElement('span');
+  extension.className = 'attachment-card__ext';
+  extension.textContent = label;
+  return extension;
+}
+
 function createAttachmentCard(record) {
   const name = record.name || 'Файл';
   const typeLabel = getAttachmentTypeLabel(record);
   const image = isImageAttachment(record);
-  let objectUrl = '';
-
-  if (record.blob) {
-    try {
-      objectUrl = URL.createObjectURL(record.blob);
-      attachmentObjectUrls.push(objectUrl);
-    } catch (error) {
-      console.warn('Не удалось создать ссылку на вложение.', error);
-    }
-  }
+  const publicUrl = record.public_url;
 
   const card = document.createElement('div');
-  card.className = `attachment-card${image && objectUrl ? ' attachment-card--image' : ' attachment-card--file'}`;
+  card.className = 'attachment-card';
+  card.dataset.attachmentType = typeLabel;
 
   let preview;
-  if (image && objectUrl) {
+
+  if (image) {
     preview = document.createElement('a');
-    preview.href = objectUrl;
+    preview.href = publicUrl;
     preview.target = '_blank';
-    preview.rel = 'noopener';
+    preview.rel = 'noopener noreferrer';
     preview.title = `Открыть «${name}»`;
 
     const imageElement = document.createElement('img');
-    imageElement.src = objectUrl;
+    imageElement.src = publicUrl;
     imageElement.alt = name;
     imageElement.loading = 'lazy';
     imageElement.decoding = 'async';
     preview.append(imageElement);
   } else {
     preview = document.createElement('span');
-    const extension = document.createElement('span');
-    extension.className = 'attachment-card__ext';
-    extension.textContent = typeLabel;
-    preview.append(extension);
+    preview.append(createAttachmentExtLabel(typeLabel));
   }
+
   preview.classList.add('attachment-card__preview');
 
   const info = document.createElement('div');
@@ -1411,26 +1589,26 @@ function createAttachmentCard(record) {
   const actions = document.createElement('div');
   actions.className = 'attachment-card__actions';
 
-  if (objectUrl) {
-    const download = document.createElement('a');
-    download.className = 'attachment-download';
-    download.href = objectUrl;
-    download.download = name;
-    download.title = `Скачать «${name}»`;
-    download.innerHTML = downloadIcon;
+  const download = document.createElement('a');
+  download.className = 'attachment-download';
+  download.href = publicUrl;
+  download.target = '_blank';
+  download.rel = 'noopener noreferrer';
+  download.download = name;
+  download.title = `Скачать «${name}»`;
+  download.innerHTML = downloadIcon;
 
-    const downloadLabel = document.createElement('span');
-    downloadLabel.textContent = 'Скачать';
-    download.append(downloadLabel);
-    actions.append(download);
-  }
+  const downloadLabel = document.createElement('span');
+  downloadLabel.textContent = 'Скачать';
+  download.append(downloadLabel);
+  actions.append(download);
 
   const removeButton = document.createElement('button');
   removeButton.type = 'button';
   removeButton.className = 'attachment-remove';
   removeButton.dataset.action = 'delete-attachment';
   removeButton.dataset.attachmentId = record.id;
-  removeButton.title = 'Удалить вложение';
+  removeButton.title = 'Удалить вложение из заметки';
   removeButton.setAttribute('aria-label', `Удалить вложение «${name}»`);
   removeButton.innerHTML = trashIcon;
   actions.append(removeButton);
@@ -1439,137 +1617,175 @@ function createAttachmentCard(record) {
   return card;
 }
 
-function renderAttachments(records) {
-  releaseAttachmentObjectUrls();
+function handleAttachmentImageError(event) {
+  const image = event.target;
+
+  if (!(image instanceof window.HTMLImageElement)) return;
+
+  const preview = image.closest('.attachment-card__preview');
+  const card = image.closest('.attachment-card');
+
+  if (!preview || !card) return;
+
+  preview.replaceChildren(
+    createAttachmentExtLabel(card.dataset.attachmentType || 'ФАЙЛ'),
+  );
+}
+
+function renderAttachmentsForNote(note) {
+  const records = Array.isArray(note?.attachments) ? [...note.attachments] : [];
+
+  records.sort((first, second) => {
+    const firstTime = Date.parse(first.uploadedAt) || 0;
+    const secondTime = Date.parse(second.uploadedAt) || 0;
+    return firstTime - secondTime;
+  });
+
   attachmentsList.replaceChildren();
+  attachmentsEmpty.hidden = records.length > 0;
 
-  const validRecords = records
-    .filter((record) => record && record.id)
-    .sort((first, second) => {
-      const firstTime = Date.parse(first.createdAt) || 0;
-      const secondTime = Date.parse(second.createdAt) || 0;
-      return firstTime - secondTime;
-    });
-
-  attachmentsEmpty.hidden = validRecords.length > 0;
-  attachmentsEmpty.textContent = 'Пока нет вложений.';
-
-  if (validRecords.length === 0) return;
+  if (records.length === 0) {
+    attachmentsEmpty.textContent = yandexToken
+      ? 'Пока нет вложений.'
+      : 'Добавьте OAuth-токен в настройках, чтобы прикреплять файлы.';
+    return;
+  }
 
   const fragment = document.createDocumentFragment();
-  for (const record of validRecords) {
+  for (const record of records) {
     fragment.append(createAttachmentCard(record));
   }
   attachmentsList.append(fragment);
 }
 
-function updateAttachmentControls() {
-  if (!attachmentsAvailable) {
-    attachButton.disabled = true;
-    attachmentsHint.textContent = 'Хранение файлов недоступно в этом браузере.';
-    return;
-  }
-
-  const hasSavedNote = Boolean(selectedNoteId) && !isCreating;
-  attachButton.disabled =
-    !hasSavedNote || attachmentLoading || attachmentUploading;
-
-  if (!hasSavedNote) {
-    attachmentsHint.textContent = 'Сначала сохраните заметку, чтобы прикрепить файлы.';
-    return;
-  }
-
-  if (attachmentUploading) {
-    attachmentsHint.textContent = 'Добавляем файлы…';
-  } else if (attachmentLoading) {
-    attachmentsHint.textContent = 'Загрузка вложений…';
-  } else {
-    attachmentsHint.textContent = 'Изображения и документы, привязанные к этой заметке.';
-  }
-}
-
-function invalidateAttachmentsView(message = 'Пока нет вложений.') {
-  attachmentLoadToken += 1;
-  attachmentLoading = false;
-  releaseAttachmentObjectUrls();
+function clearAttachmentsView(message = 'Пока нет вложений.') {
   attachmentsList.replaceChildren();
   attachmentsEmpty.hidden = false;
   attachmentsEmpty.textContent = message;
 }
 
 function resetAttachmentsForNewNote() {
-  invalidateAttachmentsView('Вложения станут доступны после сохранения заметки.');
+  clearAttachmentsView('Вложения станут доступны после сохранения заметки.');
   updateAttachmentControls();
 }
 
-async function loadAttachmentsForNote(noteId) {
-  const token = ++attachmentLoadToken;
+function updateAttachmentControls() {
+  const hasSavedNote = Boolean(selectedNoteId) && !isCreating;
+  const isUploadingCurrentNote =
+    attachmentUploading && uploadingNoteId === selectedNoteId;
 
-  releaseAttachmentObjectUrls();
-  attachmentsList.replaceChildren();
-  attachmentsEmpty.hidden = false;
-  attachmentsEmpty.textContent = 'Загрузка вложений…';
-  attachmentLoading = true;
-  updateAttachmentControls();
+  attachSpinner.hidden = !attachmentUploading;
 
-  if (!attachmentsAvailable) {
-    attachmentLoading = false;
-    attachmentsEmpty.textContent = 'Хранение файлов недоступно в этом браузере.';
+  if (attachmentUploading) {
+    attachButton.classList.add('is-uploading');
+    attachButton.style.setProperty('--upload-progress', `${uploadProgress}%`);
+    attachButton.disabled = true;
+    attachButton.setAttribute('aria-busy', 'true');
+    attachFileLabel.textContent = isUploadingCurrentNote
+      ? `Загрузка ${uploadProgress}%`
+      : 'Загрузка…';
+  } else {
+    attachButton.classList.remove('is-uploading');
+    attachButton.style.removeProperty('--upload-progress');
+    attachButton.disabled = !hasSavedNote;
+    attachButton.removeAttribute('aria-busy');
+    attachFileLabel.textContent = 'Прикрепить файл';
+  }
+
+  if (!hasSavedNote) {
+    attachmentsHint.textContent =
+      'Сначала сохраните заметку, чтобы прикреплять файлы.';
+    return;
+  }
+
+  if (attachmentUploading) {
+    attachmentsHint.textContent = isUploadingCurrentNote
+      ? `Загрузка на Яндекс.Диск: ${uploadProgress}%`
+      : 'Дождитесь завершения загрузки файлов.';
+    return;
+  }
+
+  if (!yandexToken) {
+    attachmentsHint.textContent =
+      'Добавьте OAuth-токен в настройках, чтобы прикреплять файлы.';
+    return;
+  }
+
+  attachmentsHint.textContent = 'Файлы загружаются на Яндекс.Диск, до 1 ГБ.';
+}
+
+function setUploadProgress(percent) {
+  const nextProgress = Math.max(0, Math.min(100, Math.round(percent)));
+  if (nextProgress === uploadProgress) return;
+
+  uploadProgress = nextProgress;
+
+  if (attachmentUploading) {
     updateAttachmentControls();
-    return false;
-  }
-
-  try {
-    const records = await getAttachmentsForNote(noteId);
-
-    if (token !== attachmentLoadToken || selectedNoteId !== noteId || isCreating) {
-      return false;
-    }
-
-    renderAttachments(records);
-    return true;
-  } catch (error) {
-    if (token !== attachmentLoadToken) return false;
-
-    console.error('Не удалось загрузить вложения.', error);
-    attachmentsAvailable = false;
-    releaseAttachmentObjectUrls();
-    attachmentsList.replaceChildren();
-    attachmentsEmpty.hidden = false;
-    attachmentsEmpty.textContent = 'Не удалось загрузить вложения.';
-
-    if (!attachmentStorageErrorShown) {
-      showToast('Не удалось открыть хранилище файлов.', {
-        type: 'error',
-        duration: 6000,
-      });
-      attachmentStorageErrorShown = true;
-    }
-
-    return false;
-  } finally {
-    if (token === attachmentLoadToken) {
-      attachmentLoading = false;
-      updateAttachmentControls();
-    }
   }
 }
 
-async function hasAttachmentCapacity(bytes) {
-  if (!bytes || !navigator.storage || typeof navigator.storage.estimate !== 'function') {
-    return true;
-  }
+function isNetworkFailure(error) {
+  if (!error) return false;
+  if (error instanceof TypeError) return true;
+  if (error.code === 'NETWORK_ERROR' || error.name === 'NetworkError') return true;
 
-  try {
-    const { usage = 0, quota = 0 } = await navigator.storage.estimate();
-    if (!quota) return true;
-    return usage + bytes <= quota * 0.95;
-  } catch (error) {
-    return true;
-  }
+  return /failed to fetch|networkerror|load failed|network request failed|сетев/i.test(
+    String(error.message || ''),
+  );
 }
 
-async function attachFiles(files) {
+function getUploadErrorMessage(error) {
+  if (isNetworkFailure(error)) {
+    return 'Не удалось связаться с Яндекс.Диском. Проверьте подключение к интернету и повторите попытку.';
+  }
+
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  return 'Не удалось загрузить файл на Яндекс.Диск.';
+}
+
+function getOversizedFiles(files) {
+  return files.filter((file) => Number(file.size) > MAX_ATTACHMENT_SIZE);
+}
+
+function showOversizedFilesError(files) {
+  const names = files
+    .map((file) => `«${file.name || 'Файл'}»`)
+    .join(', ');
+
+  const message =
+    files.length === 1
+      ? `Файл ${names} больше 1 ГБ. На бесплатном тарифе Яндекс.Диска такие файлы загрузить нельзя.`
+      : `Файлы ${names} больше 1 ГБ. На бесплатном тарифе Яндекс.Диска такие файлы загрузить нельзя.`;
+
+  showToast(message, {
+    type: 'error',
+    duration: 8000,
+  });
+}
+
+function addAttachmentToNote(noteId, attachment) {
+  const note = getNoteById(noteId);
+  if (!note) return null;
+
+  const updatedNote = {
+    ...note,
+    attachments: [...(note.attachments || []), attachment],
+  };
+
+  const nextNotes = notes.map((item) =>
+    item.id === noteId ? updatedNote : item,
+  );
+
+  if (!persistNotes(nextNotes)) return null;
+
+  return getNoteById(noteId);
+}
+
+async function uploadFiles(files) {
   if (isCreating || !selectedNoteId) {
     showToast('Сначала сохраните заметку, чтобы прикрепить файлы.', {
       type: 'error',
@@ -1578,66 +1794,111 @@ async function attachFiles(files) {
     return;
   }
 
-  if (!attachmentsAvailable) {
-    showToast('Хранение файлов недоступно в этом браузере.', {
-      type: 'error',
-      duration: 6000,
-    });
+  if (!yandexToken) {
+    openSettings('Сначала добавьте OAuth-токен Яндекс.Диска.');
+    return;
+  }
+
+  if (attachmentUploading) return;
+
+  if (navigator.onLine === false) {
+    showToast(
+      'Нет подключения к интернету. Проверьте сеть и повторите загрузку.',
+      {
+        type: 'error',
+        duration: 7000,
+      },
+    );
+    return;
+  }
+
+  const oversizedFiles = getOversizedFiles(files);
+
+  if (oversizedFiles.length > 0) {
+    showOversizedFilesError(oversizedFiles);
     return;
   }
 
   const targetNoteId = selectedNoteId;
-  const records = files.map((file) => ({
-    id: createId(),
-    noteId: targetNoteId,
-    name: file.name || 'Файл',
-    type: file.type || '',
-    size: Number(file.size) || 0,
-    lastModified: Number(file.lastModified) || Date.now(),
-    createdAt: new Date().toISOString(),
-    blob: file,
-  }));
-  const totalSize = records.reduce((sum, record) => sum + record.size, 0);
+  const token = yandexToken;
+  const totalFiles = files.length;
 
   attachmentUploading = true;
+  uploadingNoteId = targetNoteId;
+  uploadProgress = 0;
   updateAttachmentControls();
 
   try {
-    if (!(await hasAttachmentCapacity(totalSize))) {
-      showToast('Недостаточно места в хранилище браузера для выбранных файлов.', {
-        type: 'error',
-        duration: 6000,
+    for (let index = 0; index < totalFiles; index += 1) {
+      const file = files[index];
+      const remotePath = createRemotePath(file);
+      const uploadUrl = await getYandexUploadUrl(token, remotePath);
+
+      await uploadFileWithProgress(uploadUrl, file, (fileProgress) => {
+        setUploadProgress(((index + fileProgress) / totalFiles) * 100);
       });
-      return;
+
+      const publicUrl = await publishYandexFile(token, remotePath);
+
+      if (!isHttpsUrl(publicUrl)) {
+        throw new Error(
+          'Яндекс.Диск вернул некорректную публичную ссылку на файл.',
+        );
+      }
+
+      if (!getNoteById(targetNoteId)) {
+        throw new Error(
+          'Заметка была удалена во время загрузки. Файл остался на Яндекс.Диске.',
+        );
+      }
+
+      const attachment = {
+        id: createId(),
+        name: file.name || 'Файл',
+        type: file.type || '',
+        size: Number(file.size) || 0,
+        public_url: publicUrl,
+        remote_path: remotePath,
+        uploadedAt: new Date().toISOString(),
+      };
+
+      const updatedNote = addAttachmentToNote(targetNoteId, attachment);
+
+      if (!updatedNote) {
+        throw new Error(
+          'Файл загружен, но не удалось сохранить вложение в заметке.',
+        );
+      }
+
+      if (selectedNoteId === targetNoteId) {
+        renderAttachmentsForNote(updatedNote);
+      }
+
+      setUploadProgress(((index + 1) / totalFiles) * 100);
     }
 
-    await addAttachmentRecords(records);
-
-    // Заметку могли удалить, пока файл копировался в IndexedDB.
-    if (!getNoteById(targetNoteId)) {
-      await deleteAttachmentRecords(records.map((record) => record.id));
-      return;
-    }
-
-    const message =
-      records.length === 1
-        ? `Файл «${shorten(records[0].name, 36)}» прикреплён.`
-        : `Прикреплено файлов: ${records.length}.`;
-
-    if (selectedNoteId === targetNoteId && !isCreating) {
-      const loaded = await loadAttachmentsForNote(targetNoteId);
-      if (loaded) showToast(message);
-    } else {
-      showToast(message);
-    }
+    showToast(
+      totalFiles === 1
+        ? 'Файл загружен на Яндекс.Диск и опубликован.'
+        : `Файлы загружены на Яндекс.Диск: ${totalFiles}.`,
+    );
   } catch (error) {
-    console.error('Не удалось прикрепить файлы.', error);
-    showToast('Не удалось прикрепить файлы. Возможно, в хранилище не хватает места.', {
-      type: 'error',
-      duration: 6000,
-    });
+    console.error('Не удалось загрузить файл на Яндекс.Диск.', error);
+
+    if (error && error.code === 'YANDEX_UNAUTHORIZED') {
+      openSettings(
+        'OAuth-токен недействителен или истёк. Вставьте новый токен и сохраните настройки.',
+      );
+    } else {
+      showToast(getUploadErrorMessage(error), {
+        type: 'error',
+        duration: 8000,
+      });
+    }
   } finally {
     attachmentUploading = false;
+    uploadingNoteId = null;
+    uploadProgress = 0;
     updateAttachmentControls();
   }
 }
@@ -1647,33 +1908,42 @@ function handleAttachmentSelection(event) {
   event.target.value = '';
 
   if (files.length > 0) {
-    void attachFiles(files);
+    void uploadFiles(files);
   }
 }
 
-async function removeAttachment(attachmentId, trigger) {
-  if (!attachmentId) return;
+function removeAttachment(attachmentId, trigger) {
+  const note = getNoteById(selectedNoteId);
 
-  const noteId = selectedNoteId;
+  if (!note) return;
+
+  const currentAttachments = Array.isArray(note.attachments)
+    ? note.attachments
+    : [];
+  const nextAttachments = currentAttachments.filter(
+    (attachment) => attachment.id !== attachmentId,
+  );
+
+  if (nextAttachments.length === currentAttachments.length) return;
+
   if (trigger) trigger.disabled = true;
 
-  try {
-    await deleteAttachmentRecord(attachmentId);
+  const nextNotes = notes.map((item) =>
+    item.id === note.id ? { ...item, attachments: nextAttachments } : item,
+  );
 
-    if (selectedNoteId === noteId) {
-      const loaded = await loadAttachmentsForNote(noteId);
-      if (loaded) showToast('Вложение удалено.');
-    } else {
-      showToast('Вложение удалено.');
-    }
-  } catch (error) {
-    console.error('Не удалось удалить вложение.', error);
+  if (!persistNotes(nextNotes)) {
     if (trigger) trigger.disabled = false;
-    showToast('Не удалось удалить вложение.', {
+    showToast('Не удалось удалить вложение из заметки.', {
       type: 'error',
       duration: 6000,
     });
+    return;
   }
+
+  renderAttachmentsForNote(getNoteById(note.id));
+  updateAttachmentControls();
+  showToast('Вложение удалено из заметки.');
 }
 
 function handleAttachmentListClick(event) {
@@ -1693,14 +1963,14 @@ function createBackupPayload() {
     format: BACKUP_FORMAT,
     version: BACKUP_VERSION,
     exportedAt: new Date().toISOString(),
-    // Файлы из IndexedDB намеренно не сериализуются в JSON —
-    // резервная копия содержит только структуру и текст заметок.
-    notes: notes.map(({ id, title, content, parent_id, updatedAt }) => ({
+    // Файлы хранятся на Яндекс.Диске; в JSON попадают публичные ссылки на них.
+    notes: notes.map(({ id, title, content, parent_id, updatedAt, attachments }) => ({
       id,
       title,
       content,
       parent_id,
       updatedAt,
+      attachments,
     })),
   };
 }
@@ -1789,6 +2059,7 @@ function prepareImportedNotes(rawNotes) {
       content,
       parent_id: parentId,
       updatedAt: normalizeTimestamp(entry.updatedAt),
+      attachments: normalizeAttachments(entry.attachments),
     });
     importedIds.add(id);
   });
@@ -2024,10 +2295,42 @@ parentSelect.addEventListener('change', () => {
 
 deleteButton.addEventListener('click', deleteCurrentNote);
 
-attachButton.addEventListener('click', () => attachmentInput.click());
+attachButton.addEventListener('click', () => {
+  if (attachButton.disabled) return;
+
+  if (!selectedNoteId || isCreating) {
+    showToast('Сначала сохраните заметку, чтобы прикрепить файлы.', {
+      type: 'error',
+      duration: 5500,
+    });
+    return;
+  }
+
+  if (!yandexToken) {
+    openSettings('Сначала добавьте OAuth-токен Яндекс.Диска.');
+    return;
+  }
+
+  attachmentInput.click();
+});
 attachmentInput.addEventListener('change', handleAttachmentSelection);
 attachmentsList.addEventListener('click', handleAttachmentListClick);
-window.addEventListener('pagehide', releaseAttachmentObjectUrls);
+attachmentsList.addEventListener('error', handleAttachmentImageError, true);
+
+settingsOpenButton.addEventListener('click', () => openSettings());
+settingsCloseButton.addEventListener('click', () => closeSettings());
+settingsForm.addEventListener('submit', handleSettingsSubmit);
+settingsClearButton.addEventListener('click', handleClearYandexToken);
+yandexTokenInput.addEventListener('input', () => setSettingsError(''));
+settingsDialog.addEventListener('click', (event) => {
+  if (event.target === settingsDialog) {
+    closeSettings();
+  }
+});
+settingsDialog.addEventListener('close', () => {
+  document.body.classList.remove('settings-open');
+  setSettingsError('');
+});
 
 tree.addEventListener('click', (event) => {
   const toggle = event.target.closest('[data-action="toggle-branch"]');
@@ -2086,10 +2389,8 @@ toastAction.addEventListener('click', () => {
 
 notes = readNotes();
 sortByUpdated = readSortPreference();
+yandexToken = readYandexToken();
+settingsClearButton.disabled = !yandexToken;
 updateSortToggle();
 updateContentCount();
 showHome();
-
-if (notesStorageReadSucceeded) {
-  void cleanupOrphanedAttachments(new Set(notes.map((note) => note.id)));
-}
