@@ -118,6 +118,7 @@ let yandexToken = '';
 let attachmentUploading = false;
 let uploadProgress = 0;
 let uploadingNoteId = null;
+let appFolderReady = false;
 let deleteLocked = false;
 
 function debounce(callback, delay = 120) {
@@ -179,6 +180,11 @@ function normalizeAttachments(value) {
 
       if (!publicUrl || !isHttpsUrl(publicUrl)) return null;
 
+      const directUrlRaw =
+        typeof entry.direct_url === 'string' ? entry.direct_url.trim() : '';
+      const directUrl =
+        directUrlRaw && isHttpsUrl(directUrlRaw) ? directUrlRaw : '';
+
       let id =
         typeof entry.id === 'string' && entry.id.trim()
           ? entry.id.trim()
@@ -200,8 +206,12 @@ function normalizeAttachments(value) {
         type: typeof entry.type === 'string' ? entry.type : '',
         size: Number.isFinite(numericSize) ? Math.max(0, numericSize) : 0,
         public_url: publicUrl,
+        direct_url: directUrl,
         remote_path:
-          typeof entry.remote_path === 'string' ? entry.remote_path : '',
+          typeof entry.remote_path === 'string' &&
+          entry.remote_path.startsWith('app:/')
+            ? entry.remote_path
+            : '',
         uploadedAt: normalizeTimestamp(entry.uploadedAt),
       };
     })
@@ -1226,6 +1236,7 @@ function handleSettingsSubmit(event) {
   }
 
   yandexToken = token;
+  appFolderReady = false;
   setSettingsError('');
   settingsClearButton.disabled = false;
   refreshAttachmentsForCurrentNote();
@@ -1240,6 +1251,7 @@ function handleClearYandexToken() {
   }
 
   yandexToken = '';
+  appFolderReady = false;
   yandexTokenInput.value = '';
   setSettingsError('');
   settingsClearButton.disabled = true;
@@ -1261,25 +1273,86 @@ function refreshAttachmentsForCurrentNote() {
 
 /* ---------- Яндекс.Диск API ---------- */
 
-function sanitizeRemoteFileName(name) {
-  const safe = String(name || 'file')
-    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-')
-    .replace(/\s+/g, ' ')
-    .trim();
+function sanitizeFileName(filename) {
+  const translit = {
+    а: 'a',
+    б: 'b',
+    в: 'v',
+    г: 'g',
+    д: 'd',
+    е: 'e',
+    ё: 'e',
+    ж: 'zh',
+    з: 'z',
+    и: 'i',
+    й: 'y',
+    к: 'k',
+    л: 'l',
+    м: 'm',
+    н: 'n',
+    о: 'o',
+    п: 'p',
+    р: 'r',
+    с: 's',
+    т: 't',
+    у: 'u',
+    ф: 'f',
+    х: 'kh',
+    ц: 'ts',
+    ч: 'ch',
+    ш: 'sh',
+    щ: 'shch',
+    ъ: '',
+    ы: 'y',
+    ь: '',
+    э: 'e',
+    ю: 'yu',
+    я: 'ya',
+    і: 'i',
+    ї: 'yi',
+    є: 'ye',
+    ґ: 'g',
+    ў: 'u',
+  };
 
-  if (!safe) return 'file';
-  if (safe.length <= 120) return safe;
+  const transliterate = (value) =>
+    value
+      .split('')
+      .map((character) => {
+        const lower = character.toLowerCase();
+        return translit[lower] ?? lower;
+      })
+      .join('')
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '');
 
-  const dotIndex = safe.lastIndexOf('.');
-  const extension =
-    dotIndex > 0 && safe.length - dotIndex <= 16 ? safe.slice(dotIndex) : '';
+  const cleanPart = (value) =>
+    transliterate(String(value || ''))
+      .replace(/\s+/g, '_')
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+      .replace(/[^A-Za-z0-9_-]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^[-_]+|[-_]+$/g, '');
 
-  return `${safe.slice(0, 120 - extension.length).trimEnd()}${extension}`;
+  const originalName = String(filename || 'file');
+  const lastDot = originalName.lastIndexOf('.');
+  const rawBase = lastDot > 0 ? originalName.slice(0, lastDot) : originalName;
+  const rawExtension = lastDot > 0 ? originalName.slice(lastDot + 1) : '';
+
+  const safeBase = cleanPart(rawBase).slice(0, 100) || 'file';
+  const safeExtension = cleanPart(rawExtension)
+    .replace(/[-_]/g, '')
+    .slice(0, 10);
+
+  return safeExtension ? `${safeBase}.${safeExtension}` : safeBase;
 }
 
 function createRemotePath(file) {
   const uniquePrefix = `${Date.now()}-${createId().slice(0, 8)}`;
-  return `app:/${uniquePrefix}-${sanitizeRemoteFileName(file.name)}`;
+  const safeName = sanitizeFileName(file.name);
+  const encodedSafeName = encodeURIComponent(safeName);
+
+  return `app:/${uniquePrefix}-${encodedSafeName}`;
 }
 
 async function createYandexApiError(response) {
@@ -1345,12 +1418,106 @@ async function fetchWithTimeout(url, options = {}) {
   }
 }
 
-async function getYandexUploadUrl(token, remotePath) {
-  const url = new URL(`${YANDEX_API_BASE}/resources/upload`);
-  url.searchParams.set('path', remotePath);
-  url.searchParams.set('overwrite', 'true');
+function buildYandexApiUrl(endpoint, params) {
+  // Кодируем значения ровно один раз: путь с кириллицей и пробелами
+  // уходит в API как часть query-строки.
+  const query = Object.entries(params)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(
+      ([key, value]) =>
+        `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`,
+    )
+    .join('&');
 
-  const response = await fetchWithTimeout(url.toString(), {
+  return `${YANDEX_API_BASE}${endpoint}${query ? `?${query}` : ''}`;
+}
+
+async function ensureAppFolder(token) {
+  if (appFolderReady) return;
+
+  const checkUrl = buildYandexApiUrl('/resources', {
+    path: 'app:/',
+    fields: 'type',
+  });
+
+  let response;
+
+  try {
+    response = await fetchWithTimeout(checkUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `OAuth ${token}`,
+        Accept: 'application/json',
+      },
+    });
+  } catch (error) {
+    console.warn(
+      'Не удалось проверить папку app:/ перед загрузкой. Продолжаем.',
+      error,
+    );
+    return;
+  }
+
+  if (response.ok) {
+    appFolderReady = true;
+    return;
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    throw await createYandexApiError(response);
+  }
+
+  if (response.status !== 404) {
+    console.warn(
+      `Не удалось проверить папку app:/ (HTTP ${response.status}). Продолжаем загрузку.`,
+    );
+    return;
+  }
+
+  const createUrl = buildYandexApiUrl('/resources', {
+    path: 'app',
+  });
+
+  let createResponse;
+
+  try {
+    createResponse = await fetchWithTimeout(createUrl, {
+      method: 'PUT',
+      headers: {
+        Authorization: `OAuth ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+    });
+  } catch (error) {
+    console.warn(
+      'Не удалось создать папку app. Продолжаем загрузку.',
+      error,
+    );
+    return;
+  }
+
+  if (createResponse.ok || createResponse.status === 409) {
+    appFolderReady = true;
+    return;
+  }
+
+  if (createResponse.status === 401 || createResponse.status === 403) {
+    throw await createYandexApiError(createResponse);
+  }
+
+  console.warn(
+    `Не удалось создать папку app (HTTP ${createResponse.status}). Продолжаем загрузку.`,
+  );
+}
+
+async function getYandexUploadUrl(token, remotePath) {
+  const url = buildYandexApiUrl('/resources/upload', {
+    path: remotePath,
+    overwrite: 'true',
+  });
+
+  const response = await fetchWithTimeout(url, {
     method: 'GET',
     headers: {
       Authorization: `OAuth ${token}`,
@@ -1365,6 +1532,31 @@ async function getYandexUploadUrl(token, remotePath) {
   const data = await response.json();
   if (!data || typeof data.href !== 'string' || !data.href) {
     throw new Error('Яндекс.Диск не вернул ссылку для загрузки файла.');
+  }
+
+  return data.href;
+}
+
+async function getYandexDirectUrl(token, remotePath) {
+  const url = buildYandexApiUrl('/resources/download', {
+    path: remotePath,
+  });
+
+  const response = await fetchWithTimeout(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `OAuth ${token}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    throw await createYandexApiError(response);
+  }
+
+  const data = await response.json();
+  if (!data || typeof data.href !== 'string' || !isHttpsUrl(data.href)) {
+    throw new Error('Яндекс.Диск не вернул прямую ссылку на файл.');
   }
 
   return data.href;
@@ -1423,11 +1615,12 @@ function uploadFileWithProgress(uploadUrl, file, onProgress) {
 }
 
 async function fetchYandexPublicUrl(token, remotePath) {
-  const url = new URL(`${YANDEX_API_BASE}/resources`);
-  url.searchParams.set('path', remotePath);
-  url.searchParams.set('fields', 'public_url');
+  const url = buildYandexApiUrl('/resources', {
+    path: remotePath,
+    fields: 'public_url',
+  });
 
-  const response = await fetchWithTimeout(url.toString(), {
+  const response = await fetchWithTimeout(url, {
     method: 'GET',
     headers: {
       Authorization: `OAuth ${token}`,
@@ -1447,10 +1640,11 @@ async function fetchYandexPublicUrl(token, remotePath) {
 }
 
 async function publishYandexFile(token, remotePath) {
-  const url = new URL(`${YANDEX_API_BASE}/resources/publish`);
-  url.searchParams.set('path', remotePath);
+  const url = buildYandexApiUrl('/resources/publish', {
+    path: remotePath,
+  });
 
-  const response = await fetchWithTimeout(url.toString(), {
+  const response = await fetchWithTimeout(url, {
     method: 'PUT',
     headers: {
       Authorization: `OAuth ${token}`,
@@ -1458,6 +1652,12 @@ async function publishYandexFile(token, remotePath) {
       Accept: 'application/json',
     },
   });
+
+  if (response.status === 500) {
+    console.error(
+      `publishYandexFile: 500 Internal Server Error. URL: ${url}`,
+    );
+  }
 
   if (!response.ok) {
     throw await createYandexApiError(response);
@@ -1488,6 +1688,41 @@ async function publishYandexFile(token, remotePath) {
   throw new Error(
     'Файл загружен, но Яндекс.Диск не вернул публичную ссылку.',
   );
+}
+
+async function publishYandexFileWithRetry(token, remotePath, attempts = 3) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await publishYandexFile(token, remotePath);
+    } catch (error) {
+      lastError = error;
+
+      if (error.status !== 500) {
+        throw error;
+      }
+
+      if (attempt === attempts) break;
+
+      console.warn(
+        `publishYandexFile: попытка ${attempt} из ${attempts} завершилась 500. Повтор через 1 секунду.`,
+      );
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    }
+  }
+
+  console.error(
+    `publishYandexFile: не удалось опубликовать файл после ${attempts} попыток. Яндекс.Диск возвращал 500. Попробуйте позже.`,
+  );
+
+  const finalError = new Error(
+    'Яндекс.Диск временно вернул 500 при публикации файла. Попробуйте позже.',
+  );
+  finalError.status = 500;
+  finalError.code = 'YANDEX_PUBLISH_500';
+  finalError.cause = lastError;
+  throw finalError;
 }
 
 /* ---------- Отображение вложений ---------- */
@@ -1546,10 +1781,12 @@ function createAttachmentCard(record) {
   const typeLabel = getAttachmentTypeLabel(record);
   const image = isImageAttachment(record);
   const publicUrl = record.public_url;
+  const imageUrl = record.direct_url || publicUrl;
 
   const card = document.createElement('div');
   card.className = 'attachment-card';
   card.dataset.attachmentType = typeLabel;
+  card.dataset.attachmentId = record.id;
 
   let preview;
 
@@ -1561,7 +1798,7 @@ function createAttachmentCard(record) {
     preview.title = `Открыть «${name}»`;
 
     const imageElement = document.createElement('img');
-    imageElement.src = publicUrl;
+    imageElement.src = imageUrl;
     imageElement.alt = name;
     imageElement.loading = 'lazy';
     imageElement.decoding = 'async';
@@ -1617,11 +1854,7 @@ function createAttachmentCard(record) {
   return card;
 }
 
-function handleAttachmentImageError(event) {
-  const image = event.target;
-
-  if (!(image instanceof window.HTMLImageElement)) return;
-
+function replaceAttachmentPreviewWithFallback(image) {
   const preview = image.closest('.attachment-card__preview');
   const card = image.closest('.attachment-card');
 
@@ -1630,6 +1863,101 @@ function handleAttachmentImageError(event) {
   preview.replaceChildren(
     createAttachmentExtLabel(card.dataset.attachmentType || 'ФАЙЛ'),
   );
+}
+
+async function refreshAttachmentImage(attachmentId, image, card) {
+  const noteId = selectedNoteId;
+
+  if (!noteId || !yandexToken) {
+    replaceAttachmentPreviewWithFallback(image);
+    return;
+  }
+
+  const note = getNoteById(noteId);
+  const attachment = note?.attachments?.find(
+    (item) => item.id === attachmentId,
+  );
+
+  if (!attachment || !attachment.remote_path) {
+    replaceAttachmentPreviewWithFallback(image);
+    return;
+  }
+
+  try {
+    const directUrl = await getYandexDirectUrl(
+      yandexToken,
+      attachment.remote_path,
+    );
+
+    const latestNote = getNoteById(noteId);
+    const latestAttachment = latestNote?.attachments?.find(
+      (item) => item.id === attachmentId,
+    );
+
+    if (!latestNote || !latestAttachment) {
+      throw new Error('Вложение больше не существует.');
+    }
+
+    const nextNotes = notes.map((item) =>
+      item.id === noteId
+        ? {
+            ...item,
+            attachments: item.attachments.map((current) =>
+              current.id === attachmentId
+                ? { ...current, direct_url: directUrl }
+                : current,
+            ),
+          }
+        : item,
+    );
+
+    if (!persistNotes(nextNotes)) {
+      console.error(
+        'Не удалось сохранить direct_url вложения в localStorage.',
+        directUrl,
+      );
+    }
+
+    if (card.isConnected && image.isConnected) {
+      image.src = directUrl;
+    }
+  } catch (error) {
+    console.error(
+      'Не удалось обновить прямую ссылку изображения вложения.',
+      error,
+    );
+    replaceAttachmentPreviewWithFallback(image);
+  }
+}
+
+function handleAttachmentImageError(event) {
+  const image = event.target;
+
+  if (!(image instanceof window.HTMLImageElement)) return;
+
+  const preview = image.closest('.attachment-card__preview');
+  const card = image.closest('.attachment-card');
+
+  if (!preview || !card || !card.isConnected) return;
+
+  const failedUrl = image.currentSrc || image.src || '';
+  console.error(
+    `Не удалось загрузить изображение «${image.alt || 'без названия'}». URL: ${failedUrl}`,
+  );
+
+  const attachmentId = card.dataset.attachmentId;
+
+  if (
+    !attachmentId ||
+    !yandexToken ||
+    image.dataset.directRetry === '1'
+  ) {
+    replaceAttachmentPreviewWithFallback(image);
+    return;
+  }
+
+  image.dataset.directRetry = '1';
+  void refreshAttachmentImage(attachmentId, image, card);
 }
 
 function renderAttachmentsForNote(note) {
@@ -1829,6 +2157,8 @@ async function uploadFiles(files) {
   updateAttachmentControls();
 
   try {
+    await ensureAppFolder(token);
+
     for (let index = 0; index < totalFiles; index += 1) {
       const file = files[index];
       const remotePath = createRemotePath(file);
@@ -1838,11 +2168,25 @@ async function uploadFiles(files) {
         setUploadProgress(((index + fileProgress) / totalFiles) * 100);
       });
 
-      const publicUrl = await publishYandexFile(token, remotePath);
+      const publicUrl = await publishYandexFileWithRetry(
+        token,
+        remotePath,
+      );
 
       if (!isHttpsUrl(publicUrl)) {
         throw new Error(
           'Яндекс.Диск вернул некорректную публичную ссылку на файл.',
+        );
+      }
+
+      let directUrl = '';
+
+      try {
+        directUrl = await getYandexDirectUrl(token, remotePath);
+      } catch (error) {
+        console.error(
+          'Не удалось получить прямую ссылку на файл для предпросмотра.',
+          error,
         );
       }
 
@@ -1858,6 +2202,7 @@ async function uploadFiles(files) {
         type: file.type || '',
         size: Number(file.size) || 0,
         public_url: publicUrl,
+        direct_url: directUrl,
         remote_path: remotePath,
         uploadedAt: new Date().toISOString(),
       };
