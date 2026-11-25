@@ -14,6 +14,9 @@ const BACKUP_VERSION = 4;
 const YANDEX_API_BASE = 'https://cloud-api.yandex.net/v1/disk';
 const MAX_ATTACHMENT_SIZE = 1000 * 1000 * 1000;
 const API_REQUEST_TIMEOUT = 30000;
+const UPLOAD_READY_DELAY = 2000;
+const FILE_READY_ATTEMPTS = 10;
+const FILE_READY_RETRY_DELAY = 1000;
 const ATTACHMENT_IMAGE_TYPES = new Set([
   'image/jpeg',
   'image/jpg',
@@ -1567,8 +1570,11 @@ function uploadFileWithProgress(uploadUrl, file, onProgress) {
     const xhr = new XMLHttpRequest();
     xhr.open('PUT', uploadUrl, true);
     xhr.timeout = 30 * 60 * 1000;
+    xhr.withCredentials = false;
 
-    // Для загрузки на предподписанный URL не нужен Authorization.
+    // Origin добавляет сам браузер для cross-origin запроса — JS не может его убрать.
+    // no-cors для PUT не подходит: ответ будет opaque, прогресс и статус недоступны.
+    // Authorization здесь не передаётся — только Content-Type.
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
     xhr.upload.onprogress = (event) => {
@@ -1723,6 +1729,82 @@ async function publishYandexFileWithRetry(token, remotePath, attempts = 3) {
   finalError.code = 'YANDEX_PUBLISH_500';
   finalError.cause = lastError;
   throw finalError;
+}
+
+async function waitForYandexFile(token, remotePath, expectedSize) {
+  const url = buildYandexApiUrl('/resources', {
+    path: remotePath,
+    fields: 'size,type',
+  });
+
+  let lastStatus = 0;
+
+  for (let attempt = 1; attempt <= FILE_READY_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `OAuth ${token}`,
+          Accept: 'application/json',
+        },
+      });
+
+      lastStatus = response.status;
+
+      if (response.status === 401 || response.status === 403) {
+        throw await createYandexApiError(response);
+      }
+
+      if (response.ok) {
+        const data = await response.json();
+        const actualSize = Number(data.size);
+        const expected = Number(expectedSize);
+
+        if (
+          data.type === 'file' &&
+          (!Number.isFinite(expected) || actualSize === expected)
+        ) {
+          return;
+        }
+
+        console.warn(
+          `waitForYandexFile: файл ещё не готов (${attempt}/${FILE_READY_ATTEMPTS}), размер ${actualSize} из ${expected}.`,
+        );
+      } else {
+        console.warn(
+          `waitForYandexFile: файл ещё не виден (${attempt}/${FILE_READY_ATTEMPTS}), HTTP ${response.status}.`,
+        );
+      }
+    } catch (error) {
+      if (
+        error.code === 'YANDEX_UNAUTHORIZED' ||
+        error.code === 'YANDEX_FORBIDDEN'
+      ) {
+        throw error;
+      }
+
+      console.warn(
+        `waitForYandexFile: не удалось проверить файл (${attempt}/${FILE_READY_ATTEMPTS}).`,
+        error,
+      );
+    }
+
+    if (attempt < FILE_READY_ATTEMPTS) {
+      await new Promise((resolve) =>
+        window.setTimeout(resolve, FILE_READY_RETRY_DELAY),
+      );
+    }
+  }
+
+  console.error(
+    `waitForYandexFile: файл не появился на Диске с ожидаемым размером после ${FILE_READY_ATTEMPTS} попыток. Path: ${remotePath}`,
+  );
+  const error = new Error(
+    'Файл загружен, но ещё не появился в папке приложения на Яндекс.Диске. Попробуйте позже.',
+  );
+  error.code = 'YANDEX_FILE_NOT_READY';
+  error.status = lastStatus;
+  throw error;
 }
 
 /* ---------- Отображение вложений ---------- */
@@ -2167,6 +2249,12 @@ async function uploadFiles(files) {
       await uploadFileWithProgress(uploadUrl, file, (fileProgress) => {
         setUploadProgress(((index + fileProgress) / totalFiles) * 100);
       });
+
+      await new Promise((resolve) =>
+        window.setTimeout(resolve, UPLOAD_READY_DELAY),
+      );
+
+      await waitForYandexFile(token, remotePath, file.size);
 
       const publicUrl = await publishYandexFileWithRetry(
         token,
