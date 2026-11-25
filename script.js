@@ -107,6 +107,9 @@ const trashIcon = `
   </svg>
 `;
 
+const TRANSPARENT_IMAGE =
+  'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+
 let notes = [];
 let selectedNoteId = null;
 let isCreating = false;
@@ -178,15 +181,17 @@ function normalizeAttachments(value) {
   return value
     .filter((entry) => entry && typeof entry === 'object' && !Array.isArray(entry))
     .map((entry) => {
-      const publicUrl =
+      const publicUrlRaw =
         typeof entry.public_url === 'string' ? entry.public_url.trim() : '';
-
-      if (!publicUrl || !isHttpsUrl(publicUrl)) return null;
+      const publicUrl =
+        publicUrlRaw && isHttpsUrl(publicUrlRaw) ? publicUrlRaw : '';
 
       const directUrlRaw =
         typeof entry.direct_url === 'string' ? entry.direct_url.trim() : '';
       const directUrl =
         directUrlRaw && isHttpsUrl(directUrlRaw) ? directUrlRaw : '';
+
+      if (!publicUrl && !directUrl) return null;
 
       let id =
         typeof entry.id === 'string' && entry.id.trim()
@@ -1862,28 +1867,36 @@ function createAttachmentCard(record) {
   const name = record.name || 'Файл';
   const typeLabel = getAttachmentTypeLabel(record);
   const image = isImageAttachment(record);
-  const publicUrl = record.public_url;
-  const imageUrl = record.direct_url || publicUrl;
+  const publicUrl = isHttpsUrl(record.public_url) ? record.public_url : '';
+  const directUrl = isHttpsUrl(record.direct_url) ? record.direct_url : '';
+  const linkUrl = publicUrl || directUrl;
+  const imageUrl = directUrl;
 
   const card = document.createElement('div');
   card.className = 'attachment-card';
   card.dataset.attachmentType = typeLabel;
   card.dataset.attachmentId = record.id;
+  card.dataset.publicUrl = publicUrl;
 
   let preview;
 
   if (image) {
     preview = document.createElement('a');
-    preview.href = publicUrl;
+    preview.href = linkUrl;
     preview.target = '_blank';
     preview.rel = 'noopener noreferrer';
     preview.title = `Открыть «${name}»`;
 
     const imageElement = document.createElement('img');
-    imageElement.src = imageUrl;
+    imageElement.src = imageUrl || TRANSPARENT_IMAGE;
     imageElement.alt = name;
     imageElement.loading = 'lazy';
     imageElement.decoding = 'async';
+
+    if (!imageUrl) {
+      imageElement.dataset.directPending = '1';
+    }
+
     preview.append(imageElement);
   } else {
     preview = document.createElement('span');
@@ -1910,7 +1923,7 @@ function createAttachmentCard(record) {
 
   const download = document.createElement('a');
   download.className = 'attachment-download';
-  download.href = publicUrl;
+  download.href = linkUrl;
   download.target = '_blank';
   download.rel = 'noopener noreferrer';
   download.download = name;
@@ -2002,6 +2015,14 @@ async function refreshAttachmentImage(attachmentId, image, card) {
 
     if (card.isConnected && image.isConnected) {
       image.src = directUrl;
+
+      if (!card.dataset.publicUrl) {
+        const preview = card.querySelector('.attachment-card__preview');
+        const download = card.querySelector('.attachment-download');
+
+        if (preview) preview.href = directUrl;
+        if (download) download.href = directUrl;
+      }
     }
   } catch (error) {
     console.error(
@@ -2066,6 +2087,21 @@ function renderAttachmentsForNote(note) {
     fragment.append(createAttachmentCard(record));
   }
   attachmentsList.append(fragment);
+
+  const pendingImages = attachmentsList.querySelectorAll(
+    'img[data-direct-pending="1"]',
+  );
+
+  for (const image of pendingImages) {
+    const card = image.closest('.attachment-card');
+    const attachmentId = card?.dataset.attachmentId;
+
+    if (!card || !attachmentId) continue;
+
+    image.dataset.directPending = '0';
+    image.dataset.directRetry = '1';
+    void refreshAttachmentImage(attachmentId, image, card);
+  }
 }
 
 function clearAttachmentsView(message = 'Пока нет вложений.') {
