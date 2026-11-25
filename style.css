@@ -529,9 +529,36 @@ kbd {
   opacity: 0.45;
 }
 
+.backup-btn.is-loading {
+  color: var(--accent-color);
+}
+
+.backup-btn.is-loading > svg {
+  display: none;
+}
+
+.backup-btn.is-loading:disabled {
+  cursor: progress;
+  opacity: 1;
+}
+
 .backup-btn svg {
   flex: 0 0 auto;
   color: var(--text-tertiary);
+}
+
+.backup-spinner {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(5, 150, 105, 0.22);
+  border-top-color: var(--accent-color);
+  border-radius: 50%;
+  animation: attach-spin 0.7s linear infinite;
+}
+
+.backup-spinner[hidden] {
+  display: none;
 }
 
 .local-note {
@@ -1454,6 +1481,171 @@ body.settings-open {
 }
 
 /* =========================================================
+   Восстановление из облака
+   ========================================================= */
+
+body.restore-open {
+  overflow: hidden;
+}
+
+.restore-dialog {
+  width: min(540px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 0;
+  overflow: auto;
+  color: var(--text);
+  background: var(--surface);
+  border: 0;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-popover);
+}
+
+.restore-dialog::backdrop {
+  background: rgba(15, 15, 15, 0.32);
+  backdrop-filter: blur(2px);
+}
+
+.restore-dialog__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 24px 24px 0;
+}
+
+.restore-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.restore-subtitle {
+  margin: 4px 0 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.restore-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  padding: 16px 24px 0;
+}
+
+.restore-status {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.restore-status.is-error {
+  color: var(--danger);
+}
+
+.restore-spinner {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(5, 150, 105, 0.22);
+  border-top-color: var(--accent-color);
+  border-radius: 50%;
+  animation: attach-spin 0.7s linear infinite;
+}
+
+.restore-spinner[hidden] {
+  display: none;
+}
+
+.restore-list {
+  display: grid;
+  gap: 6px;
+  max-height: 360px;
+  padding: 12px 24px 24px;
+  overflow: auto;
+}
+
+.restore-list:empty {
+  display: none;
+}
+
+.restore-empty {
+  margin: 0;
+  padding: 8px 24px 24px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.restore-file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  background: var(--bg);
+  border: 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.restore-file:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.restore-file:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.restore-file__icon {
+  display: grid;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  color: var(--accent-color);
+  background: var(--accent-light);
+  border-radius: var(--radius-sm);
+  place-items: center;
+}
+
+.restore-file__info {
+  display: block;
+  min-width: 0;
+}
+
+.restore-file__name {
+  display: block;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.restore-file__meta {
+  display: block;
+  margin: 3px 0 0;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+/* =========================================================
    Уведомление
    ========================================================= */
 
@@ -1767,6 +1959,27 @@ body.settings-open {
   .settings-actions .btn-primary,
   .settings-actions .btn-secondary {
     width: 100%;
+  }
+
+  .restore-dialog {
+    width: calc(100vw - 24px);
+  }
+
+  .restore-dialog__head {
+    padding: 20px 20px 0;
+  }
+
+  .restore-status-row {
+    padding: 14px 20px 0;
+  }
+
+  .restore-list {
+    max-height: 300px;
+    padding: 10px 20px 20px;
+  }
+
+  .restore-empty {
+    padding: 8px 20px 20px;
   }
 
   .toast {

@@ -71,6 +71,16 @@ const settingsCloseButton = document.querySelector('#settings-close');
 const settingsClearButton = document.querySelector('#settings-clear');
 const settingsError = document.querySelector('#settings-error');
 const yandexTokenInput = document.querySelector('#yandex-token');
+const backupToDiskButton = document.querySelector('#backup-to-disk');
+const backupToDiskLabel = document.querySelector('#backup-to-disk-label');
+const backupSpinner = document.querySelector('#backup-spinner');
+const restoreFromCloudButton = document.querySelector('#restore-from-cloud');
+const restoreDialog = document.querySelector('#restore-dialog');
+const restoreCloseButton = document.querySelector('#restore-close');
+const restoreList = document.querySelector('#restore-list');
+const restoreEmpty = document.querySelector('#restore-empty');
+const restoreStatus = document.querySelector('#restore-status');
+const restoreSpinner = document.querySelector('#restore-spinner');
 const exportButton = document.querySelector('#export-notes');
 const importButton = document.querySelector('#import-notes');
 const importFileInput = document.querySelector('#import-file');
@@ -125,6 +135,9 @@ let attachmentUploading = false;
 let uploadProgress = 0;
 let uploadingNoteId = null;
 let appFolderReady = false;
+let backupInProgress = false;
+let restoreInProgress = false;
+let restoreRequestToken = 0;
 let deleteLocked = false;
 
 function debounce(callback, delay = 120) {
@@ -2478,6 +2491,536 @@ function downloadBackup() {
   }
 }
 
+function createDiskBackupFileName(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, '0');
+  const datePart = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  const timePart = `${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
+
+  return `backup_${datePart}_${timePart}.json`;
+}
+
+function isYandexAuthError(error) {
+  return Boolean(error) && (
+    error.code === 'YANDEX_UNAUTHORIZED' ||
+    error.code === 'YANDEX_FORBIDDEN' ||
+    error.status === 401 ||
+    error.status === 403
+  );
+}
+
+function getBackupErrorMessage(error) {
+  if (isNetworkFailure(error)) {
+    return 'Не удалось связаться с Яндекс.Диском. Проверьте подключение к интернету и повторите попытку.';
+  }
+
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  return 'Не удалось сохранить резервную копию на Яндекс.Диск.';
+}
+
+function setBackupLoading(isLoading) {
+  backupToDiskButton.disabled = isLoading;
+  backupToDiskButton.classList.toggle('is-loading', isLoading);
+  backupSpinner.hidden = !isLoading;
+  backupToDiskLabel.textContent = isLoading
+    ? 'Сохраняю…'
+    : 'Сохранить копию на Диск';
+
+  if (isLoading) {
+    backupToDiskButton.setAttribute('aria-busy', 'true');
+  } else {
+    backupToDiskButton.removeAttribute('aria-busy');
+  }
+}
+
+async function backupToYandexDisk() {
+  if (backupInProgress) return;
+
+  if (!yandexToken) {
+    openSettings(
+      'OAuth-токен не введён. Проверьте токен в настройках.',
+    );
+    return;
+  }
+
+  const token = yandexToken;
+  backupInProgress = true;
+  setBackupLoading(true);
+
+  try {
+    await ensureAppFolder(token);
+
+    const folderUrl = buildYandexApiUrl('/resources', {
+      path: 'app:/backups',
+    });
+
+    const folderResponse = await fetchWithTimeout(folderUrl, {
+      method: 'PUT',
+      headers: {
+        Authorization: `OAuth ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+    });
+
+    if (!folderResponse.ok && folderResponse.status !== 409) {
+      throw await createYandexApiError(folderResponse);
+    }
+
+    const fileName = createDiskBackupFileName();
+    const remotePath = `app:/backups/${fileName}`;
+    const uploadUrlApi = buildYandexApiUrl('/resources/upload', {
+      path: remotePath,
+      overwrite: 'true',
+    });
+
+    const uploadUrlResponse = await fetchWithTimeout(uploadUrlApi, {
+      method: 'GET',
+      headers: {
+        Authorization: `OAuth ${token}`,
+        Accept: 'application/json',
+      },
+    });
+
+    if (!uploadUrlResponse.ok) {
+      throw await createYandexApiError(uploadUrlResponse);
+    }
+
+    const uploadData = await uploadUrlResponse.json();
+
+    if (
+      !uploadData ||
+      typeof uploadData.href !== 'string' ||
+      !isHttpsUrl(uploadData.href)
+    ) {
+      throw new Error('Яндекс.Диск не вернул ссылку для загрузки копии.');
+    }
+
+    const json = `${JSON.stringify(createBackupPayload(), null, 2)}\n`;
+    const blob = new Blob([json], {
+      type: 'application/json;charset=utf-8',
+    });
+
+    await uploadFileWithProgress(
+      uploadData.href,
+      blob,
+      (fileProgress) => {
+        const percent = Math.round(
+          Math.min(Math.max(fileProgress, 0), 1) * 100,
+        );
+        backupToDiskLabel.textContent = `Сохраняю ${percent}%`;
+      },
+    );
+
+    showToast(`Резервная копия «${fileName}» сохранена в app:/backups.`, {
+      duration: 6500,
+    });
+  } catch (error) {
+    console.error(
+      'Не удалось сохранить резервную копию на Яндекс.Диск.',
+      error,
+    );
+
+    if (isYandexAuthError(error)) {
+      openSettings('Проверьте токен в настройках.');
+    } else {
+      showToast(getBackupErrorMessage(error), {
+        type: 'error',
+        duration: 8000,
+      });
+    }
+  } finally {
+    backupInProgress = false;
+    setBackupLoading(false);
+  }
+}
+
+function formatRestoreDate(value) {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) return 'Дата неизвестна';
+
+  return new Intl.DateTimeFormat('ru-RU', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+}
+
+function prepareRestoredNotes(rawNotes) {
+  if (!Array.isArray(rawNotes)) return [];
+
+  const seenIds = new Set();
+  const restored = [];
+
+  for (const entry of rawNotes) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      continue;
+    }
+
+    const title = typeof entry.title === 'string' ? entry.title : '';
+    const content = typeof entry.content === 'string' ? entry.content : '';
+
+    if (!title.trim() && !content.trim()) continue;
+
+    let id =
+      typeof entry.id === 'string' && entry.id.trim()
+        ? entry.id.trim()
+        : createId();
+
+    while (seenIds.has(id)) {
+      id = createId();
+    }
+    seenIds.add(id);
+
+    let parentId =
+      typeof entry.parent_id === 'string' && entry.parent_id.trim()
+        ? entry.parent_id.trim()
+        : null;
+
+    if (parentId === id) parentId = null;
+
+    restored.push({
+      id,
+      title,
+      content,
+      parent_id: parentId,
+      updatedAt: normalizeTimestamp(entry.updatedAt),
+      attachments: normalizeAttachments(entry.attachments),
+    });
+  }
+
+  return sanitizeNotes(restored);
+}
+
+function setRestoreMessage(message = '', isError = false) {
+  restoreStatus.textContent = message;
+  restoreStatus.classList.toggle('is-error', Boolean(message) && isError);
+}
+
+function setRestoreBusy(isBusy, message = '') {
+  restoreSpinner.hidden = !isBusy;
+  restoreList
+    .querySelectorAll('button')
+    .forEach((button) => {
+      button.disabled = isBusy;
+    });
+
+  if (message) {
+    setRestoreMessage(message);
+  }
+
+  if (isBusy) {
+    restoreDialog.setAttribute('aria-busy', 'true');
+  } else {
+    restoreDialog.removeAttribute('aria-busy');
+  }
+}
+
+function renderRestoreFiles(files) {
+  restoreList.replaceChildren();
+  restoreEmpty.hidden = files.length > 0;
+  setRestoreMessage('');
+
+  if (files.length === 0) {
+    restoreEmpty.textContent = 'В папке app:/backups нет JSON-файлов.';
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+
+  for (const file of files) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'restore-file';
+    button.dataset.backupName = file.name;
+    button.title = `Восстановить из «${file.name}»`;
+
+    const icon = document.createElement('span');
+    icon.className = 'restore-file__icon';
+    icon.innerHTML = downloadIcon;
+
+    const info = document.createElement('span');
+    info.className = 'restore-file__info';
+
+    const name = document.createElement('span');
+    name.className = 'restore-file__name';
+    name.textContent = file.name;
+
+    const meta = document.createElement('span');
+    meta.className = 'restore-file__meta';
+    meta.textContent = `${formatRestoreDate(file.created || file.modified)} · ${formatFileSize(file.size)}`;
+
+    info.append(name, meta);
+    button.append(icon, info);
+    fragment.append(button);
+  }
+
+  restoreList.append(fragment);
+}
+
+function closeRestoreDialog() {
+  restoreRequestToken += 1;
+  restoreInProgress = false;
+
+  if (restoreDialog.open && typeof restoreDialog.close === 'function') {
+    restoreDialog.close();
+  } else {
+    restoreDialog.removeAttribute('open');
+  }
+
+  document.body.classList.remove('restore-open');
+  restoreFromCloudButton.focus();
+}
+
+async function loadRestoreFiles(requestId) {
+  const url = buildYandexApiUrl('/resources', {
+    path: 'app:/backups',
+    limit: '100',
+    sort: '-created',
+  });
+
+  try {
+    const response = await fetchWithTimeout(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `OAuth ${yandexToken}`,
+        Accept: 'application/json',
+      },
+    });
+
+    if (requestId !== restoreRequestToken || !restoreDialog.open) return;
+
+    if (response.status === 404) {
+      restoreEmpty.hidden = false;
+      restoreEmpty.textContent =
+        'Папка app:/backups не найдена. Сначала сохраните копию на Диск.';
+      setRestoreMessage('');
+      return;
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      closeRestoreDialog();
+      openSettings('Проверьте токен в настройках.');
+      return;
+    }
+
+    if (!response.ok) {
+      throw await createYandexApiError(response);
+    }
+
+    const data = await response.json();
+
+    if (requestId !== restoreRequestToken || !restoreDialog.open) return;
+
+    const items = Array.isArray(data?._embedded?.items)
+      ? data._embedded.items
+      : [];
+
+    const files = items
+      .filter(
+        (item) =>
+          item &&
+          item.type === 'file' &&
+          typeof item.name === 'string' &&
+          /\.json$/i.test(item.name),
+      )
+      .sort((first, second) => {
+        const firstTime =
+          Date.parse(first.created || first.modified) || 0;
+        const secondTime =
+          Date.parse(second.created || second.modified) || 0;
+        return secondTime - firstTime;
+      });
+
+    renderRestoreFiles(files);
+  } catch (error) {
+    if (requestId !== restoreRequestToken || !restoreDialog.open) return;
+
+    if (isYandexAuthError(error)) {
+      closeRestoreDialog();
+      openSettings('Проверьте токен в настройках.');
+      return;
+    }
+
+    setRestoreMessage(getBackupErrorMessage(error), true);
+  }
+}
+
+async function openRestoreDialog() {
+  if (restoreInProgress) return;
+
+  if (!yandexToken) {
+    openSettings('Сначала добавьте OAuth-токен Яндекс.Диска.');
+    return;
+  }
+
+  if (restoreDialog.open) return;
+
+  const requestId = ++restoreRequestToken;
+  restoreInProgress = true;
+  restoreList.replaceChildren();
+  restoreEmpty.hidden = true;
+  restoreEmpty.textContent = '';
+  setRestoreMessage('');
+
+  if (typeof restoreDialog.showModal === 'function') {
+    restoreDialog.showModal();
+  } else {
+    restoreDialog.setAttribute('open', '');
+  }
+
+  document.body.classList.add('restore-open');
+  setRestoreBusy(true, 'Загружаю список резервных копий…');
+
+  try {
+    await loadRestoreFiles(requestId);
+  } finally {
+    restoreInProgress = false;
+
+    if (requestId === restoreRequestToken && restoreDialog.open) {
+      setRestoreBusy(false);
+    }
+  }
+}
+
+async function restoreBackupFile(fileName) {
+  if (restoreInProgress || !fileName) return;
+
+  const confirmed = window.confirm(
+    'Вы уверены? Текущие заметки будут заменены данными из резервной копии',
+  );
+
+  if (!confirmed) return;
+
+  const requestId = ++restoreRequestToken;
+  restoreInProgress = true;
+  setRestoreBusy(true, 'Скачиваю и восстанавливаю базу…');
+
+  try {
+    const downloadUrl = buildYandexApiUrl('/resources/download', {
+      path: `app:/backups/${fileName}`,
+    });
+
+    const response = await fetchWithTimeout(downloadUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `OAuth ${yandexToken}`,
+        Accept: 'application/json',
+      },
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      closeRestoreDialog();
+      openSettings('Проверьте токен в настройках.');
+      return;
+    }
+
+    if (response.status === 404) {
+      throw new Error('Выбранный файл резервной копии не найден.');
+    }
+
+    if (!response.ok) {
+      throw await createYandexApiError(response);
+    }
+
+    const data = await response.json();
+
+    if (
+      !data ||
+      typeof data.href !== 'string' ||
+      !isHttpsUrl(data.href)
+    ) {
+      throw new Error('Яндекс.Диск не вернул ссылку для скачивания копии.');
+    }
+
+    const fileResponse = await fetchWithTimeout(data.href, {
+      method: 'GET',
+    });
+
+    if (!fileResponse.ok) {
+      throw new Error(
+        `Не удалось скачать резервную копию (HTTP ${fileResponse.status}).`,
+      );
+    }
+
+    const text = await fileResponse.text();
+
+    if (requestId !== restoreRequestToken || !restoreDialog.open) return;
+
+    let parsed;
+
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      throw new Error('Файл не является корректным JSON.');
+    }
+
+    const rawNotes = extractNotesFromBackup(parsed);
+
+    if (!Array.isArray(rawNotes)) {
+      throw new Error('В файле не найден список заметок.');
+    }
+
+    const restoredNotes = prepareRestoredNotes(rawNotes);
+
+    if (restoredNotes.length === 0) {
+      throw new Error('В резервной копии нет заметок для восстановления.');
+    }
+
+    if (!persistNotes(restoredNotes)) {
+      throw new Error(
+        'Не удалось заменить локальную базу. Возможно, хранилище браузера заполнено.',
+      );
+    }
+
+    selectedNoteId = null;
+    isCreating = false;
+    draftParentId = null;
+    collapsedIds = new Set();
+
+    closeRestoreDialog();
+    showHome();
+    showToast(
+      `База восстановлена: ${restoredNotes.length} ${getNoteWord(restoredNotes.length)}.`,
+      { duration: 6500 },
+    );
+  } catch (error) {
+    console.error(
+      'Не удалось восстановить базу из Яндекс.Диска.',
+      error,
+    );
+
+    if (requestId !== restoreRequestToken || !restoreDialog.open) return;
+
+    if (isYandexAuthError(error)) {
+      closeRestoreDialog();
+      openSettings('Проверьте токен в настройках.');
+      return;
+    }
+
+    setRestoreMessage(getBackupErrorMessage(error), true);
+  } finally {
+    restoreInProgress = false;
+
+    if (requestId === restoreRequestToken && restoreDialog.open) {
+      setRestoreBusy(false);
+    }
+  }
+}
+
+function handleRestoreListClick(event) {
+  const fileButton = event.target.closest('[data-backup-name]');
+
+  if (!fileButton || restoreInProgress) return;
+
+  void restoreBackupFile(fileButton.dataset.backupName);
+}
+
 function extractNotesFromBackup(data) {
   if (Array.isArray(data)) return data;
   if (data && typeof data === 'object' && Array.isArray(data.notes)) return data.notes;
@@ -2824,6 +3367,20 @@ breadcrumbs.addEventListener('click', (event) => {
   }
 });
 
+backupToDiskButton.addEventListener('click', backupToYandexDisk);
+restoreFromCloudButton.addEventListener('click', openRestoreDialog);
+restoreCloseButton.addEventListener('click', closeRestoreDialog);
+restoreList.addEventListener('click', handleRestoreListClick);
+restoreDialog.addEventListener('click', (event) => {
+  if (event.target === restoreDialog) {
+    closeRestoreDialog();
+  }
+});
+restoreDialog.addEventListener('close', () => {
+  document.body.classList.remove('restore-open');
+  restoreRequestToken += 1;
+  restoreInProgress = false;
+});
 exportButton.addEventListener('click', downloadBackup);
 importButton.addEventListener('click', () => importFileInput.click());
 importFileInput.addEventListener('change', handleImportChange);

@@ -94,6 +94,35 @@
 
           <button
             class="backup-btn"
+            id="backup-to-disk"
+            type="button"
+            title="Сохранить резервную копию в папку app:/backups на Яндекс.Диске"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M7 18a4.5 4.5 0 0 1-.5-8.97A6 6 0 0 1 18 9.2a3.9 3.9 0 0 1 .5 7.8"/>
+              <path d="M12 11v7"/>
+              <path d="m9 15 3-3 3 3"/>
+            </svg>
+            <span class="backup-spinner" id="backup-spinner" aria-hidden="true" hidden></span>
+            <span id="backup-to-disk-label">Сохранить копию на Диск</span>
+          </button>
+
+          <button
+            class="backup-btn"
+            id="restore-from-cloud"
+            type="button"
+            title="Восстановить базу из папки app:/backups на Яндекс.Диске"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M7 18a4.5 4.5 0 0 1-.5-8.97A6 6 0 0 1 18 9.2a3.9 3.9 0 0 1 .5 7.8"/>
+              <path d="M12 18v-7"/>
+              <path d="m9 14 3 3 3-3"/>
+            </svg>
+            <span>Восстановить из облака</span>
+          </button>
+
+          <button
+            class="backup-btn"
             id="export-notes"
             type="button"
             title="Скачать все заметки в файл notes.json"
@@ -338,6 +367,28 @@
         <button class="btn-primary" type="submit">Сохранить</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog class="restore-dialog" id="restore-dialog" aria-labelledby="restore-title">
+    <div class="restore-dialog__head">
+      <div>
+        <h2 class="restore-title" id="restore-title">Восстановить из облака</h2>
+        <p class="restore-subtitle">Выберите резервную копию из папки app:/backups.</p>
+      </div>
+      <button class="icon-btn" id="restore-close" type="button" aria-label="Закрыть выбор резервной копии">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+          <path d="m6 6 12 12M18 6 6 18"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="restore-status-row">
+      <span class="restore-spinner" id="restore-spinner" aria-hidden="true" hidden></span>
+      <p class="restore-status" id="restore-status" role="status" aria-live="polite"></p>
+    </div>
+
+    <div class="restore-list" id="restore-list"></div>
+    <p class="restore-empty" id="restore-empty" hidden></p>
   </dialog>
 </body>
 </html>
